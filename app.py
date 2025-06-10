@@ -191,6 +191,9 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
     total_grid_import = 0
     total_consumption = cons.sum() * 5
     
+    # Calculate base case annual cost once
+    base_case_annual_cost = cons.sum() * config['grid_price_buy']
+    
     # Pre-calculate PV degradation factors for all years
     pv_degradation_factors = (1 - pv_degr_rate) ** np.arange(5)
     
@@ -423,13 +426,23 @@ def find_optimal_system(user_inputs, config, pvgis_baseline):
         
         # Show sample results for debugging
         if results_matrix and st.checkbox("Show sample results for debugging"):
-            sample_results = results_matrix[:5]  # First 5 results
-            for i, res in enumerate(sample_results):
-                st.write(f"Config {i+1}: PV={res['pv_kwp']}kWp, BESS={res['bess_kwh']}kWh")
-                st.write(f"  - NPV: €{res['npv_eur']:,.0f}")
-                st.write(f"  - Payback: {res['payback_period_years']:.1f} years")
-                st.write(f"  - CAPEX: €{res['total_capex_eur']:,.0f}")
-                st.write(f"  - Annual savings (Y1): €{res['annual_savings'][0]:,.0f}")
+            st.write("**First 5 configurations analyzed:**")
+            for i, res in enumerate(results_matrix[:5]):
+                with st.expander(f"Config {i+1}: PV={res['pv_kwp']}kWp, BESS={res['bess_kwh']}kWh"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write(f"**Financial:**")
+                        st.write(f"- CAPEX: €{res['total_capex_eur']:,.0f}")
+                        st.write(f"- NPV (Differential): €{res['npv_eur']:,.0f}")
+                        st.write(f"- Payback: {res['payback_period_years']:.1f} years")
+                        st.write(f"- Annual O&M: €{res['om_costs']:,.0f}")
+                    with col2:
+                        st.write(f"**Performance:**")
+                        st.write(f"- Self-sufficiency: {res['self_sufficiency_rate']*100:.1f}%")
+                        st.write(f"- Annual savings Y1: €{res['annual_savings'][0]:,.0f}")
+                        st.write(f"- Battery SoH Y5: {res['final_soh_percent']:.1f}%")
+                        if 'base_case_annual_cost' in res:
+                            st.write(f"- Base case cost: €{res['base_case_annual_cost']:,.0f}/year")
     else:
         st.warning("No valid configurations found within constraints")
     
@@ -554,6 +567,7 @@ def build_ui():
             st.info("💡 Italian market avg: Buy €0.30-0.40/kWh, Sell €0.10-0.15/kWh")
             grid_buy = st.number_input("Grid Buy Price (€/kWh)", value=0.35, format="%.3f", min_value=0.10, max_value=1.00)
             grid_sell = st.number_input("Grid Sell Price (€/kWh)", value=0.12, format="%.3f", min_value=0.01, max_value=0.50)
+            st.warning("⚠️ Electricity prices have a major impact on results. Use accurate local prices!")
             
             st.write("**Financial Parameters**")
             wacc = st.slider("WACC (%)", min_value=1, max_value=15, value=7) / 100
@@ -744,7 +758,7 @@ def build_ui():
                         help="Percentage of consumption covered by PV+BESS"
                     )
                 
-                # Financial details
+                # Financial details with base case comparison
                 st.subheader("💰 Financial Analysis")
                 col1, col2, col3 = st.columns(3)
                 
@@ -757,9 +771,9 @@ def build_ui():
                 
                 with col2:
                     st.metric(
-                        "10-Year NPV",
+                        "10-Year NPV (Differential)",
                         f"€{optimal_system['npv_eur']:,.0f}",
-                        help="Net Present Value over 10 years"
+                        help="Net Present Value compared to buying all energy from grid"
                     )
                 
                 with col3:
@@ -768,6 +782,58 @@ def build_ui():
                         f"€{optimal_system['om_costs']:,.0f}",
                         help="Operation & Maintenance costs per year"
                     )
+                
+                # Base case comparison
+                with st.expander("📊 Base Case Comparison"):
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.metric(
+                            "Base Case Annual Cost",
+                            f"€{optimal_system.get('base_case_annual_cost', 0):,.0f}",
+                            help="Annual cost of buying all energy from grid"
+                        )
+                    
+                    with col2:
+                        st.metric(
+                            "Base Case 10-Year NPV",
+                            f"€{optimal_system.get('base_case_npv_eur', 0):,.0f}",
+                            help="NPV of continuing to buy all energy from grid"
+                        )
+                    
+                    with col3:
+                        # Il benefit è già l'NPV differenziale
+                        if optimal_system.get('base_case_annual_cost', 0) > 0:
+                            roi = (optimal_system['npv_eur'] / optimal_system['total_capex_eur']) * 100
+                            st.metric(
+                                "ROI (10 years)",
+                                f"{roi:.1f}%",
+                                help="Return on Investment over 10 years"
+                            )
+                        else:
+                            st.metric(
+                                "Total Benefit",
+                                f"€{optimal_system['npv_eur']:,.0f}",
+                                help="Total financial benefit vs base case"
+                            )
+                    
+                    st.info("""
+                    **NPV Calculation Method (Differential Approach):**
+                    
+                    The NPV is calculated using differential cash flows compared to the base case:
+                    
+                    📊 **Cash Flow Formula:**
+                    - Year 0: CF₀ = -CAPEX
+                    - Years 1-10: CFₙ = (Base Cost - System Cost) - O&M
+                    
+                    Where:
+                    - Base Cost = Annual consumption × Grid buy price
+                    - System Cost = Energy bought × Buy price - Energy sold × Sell price
+                    - NPV = Σ(CFₙ / (1 + WACC)ⁿ)
+                    
+                    This represents the net financial benefit of installing the PV+BESS system
+                    compared to continuing to buy all energy from the grid.
+                    """)
                 
                 # System health
                 st.subheader("🔋 System Performance")
@@ -789,13 +855,64 @@ def build_ui():
                             f"+€{optimal_system['annual_savings'][4] - optimal_system['annual_savings'][0]:,.0f} by Year 5"
                         )
                     
-                    # Savings progression
-                    with st.expander("📊 View Savings Progression"):
-                        savings_df = pd.DataFrame({
-                            'Year': range(1, 6),
-                            'Net Savings (€)': optimal_system['annual_savings']
+                    # Savings progression with cash flow visualization
+                    with st.expander("📊 View Cash Flow Analysis"):
+                        # Create cash flow data
+                        years = list(range(0, 11))
+                        differential_cf = [-optimal_system['total_capex_eur']]  # Year 0
+                        cumulative_cf = [-optimal_system['total_capex_eur']]
+                        
+                        # Years 1-5 (actual data)
+                        for i in range(5):
+                            annual_cf = optimal_system['annual_savings'][i] - optimal_system['om_costs']
+                            differential_cf.append(annual_cf)
+                            cumulative_cf.append(cumulative_cf[-1] + annual_cf)
+                        
+                        # Years 6-10 (projected)
+                        last_cf = differential_cf[-1]
+                        for i in range(5):
+                            # Simple projection
+                            projected_cf = last_cf * 0.98  # 2% degradation
+                            differential_cf.append(projected_cf)
+                            cumulative_cf.append(cumulative_cf[-1] + projected_cf)
+                            last_cf = projected_cf
+                        
+                        # Create DataFrame for visualization
+                        cf_df = pd.DataFrame({
+                            'Year': years,
+                            'Annual Cash Flow (€)': differential_cf,
+                            'Cumulative Cash Flow (€)': cumulative_cf
                         })
-                        st.bar_chart(savings_df.set_index('Year'))
+                        
+                        # Display table
+                        st.write("**Differential Cash Flow Analysis:**")
+                        st.dataframe(
+                            cf_df.style.format({
+                                'Annual Cash Flow (€)': '{:,.0f}',
+                                'Cumulative Cash Flow (€)': '{:,.0f}'
+                            }),
+                            use_container_width=True
+                        )
+                        
+                        # Line chart comparing cumulative costs
+                        st.line_chart(
+                            cf_df.set_index('Year')['Cumulative Cash Flow (€)'],
+                            height=300
+                        )
+                        st.caption("Cumulative cash flow showing payback period (when line crosses zero)")
+                        
+                        # Key metrics
+                        st.write("**Key Financial Metrics:**")
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.write(f"Total investment: €{optimal_system['total_capex_eur']:,.0f}")
+                        with col2:
+                            st.write(f"Avg annual benefit: €{sum(differential_cf[1:6])/5:,.0f}")
+                        with col3:
+                            if optimal_system['payback_period_years'] != float('inf'):
+                                st.write(f"Break-even: Year {optimal_system['payback_period_years']:.1f}")
+                            else:
+                                st.write("Break-even: > 10 years")
                 
                 # Recommendations
                 st.subheader("💡 Recommendations")
@@ -824,6 +941,16 @@ def build_ui():
                 # Export results
                 st.markdown("---")
                 payback_text = f"{optimal_system['payback_period_years']:.1f} years" if optimal_system['payback_period_years'] != float('inf') else "> 25 years"
+                base_case_info = f"""
+                Base Case Analysis (No PV/BESS System):
+                - Annual electricity cost: €{optimal_system.get('base_case_annual_cost', 0):,.0f}
+                - 10-year NPV of costs: €{optimal_system.get('base_case_npv_eur', 0):,.0f}
+                
+                The NPV shown above (€{optimal_system['npv_eur']:,.0f}) represents the net financial
+                benefit of installing the PV+BESS system compared to continuing to buy all energy
+                from the grid (differential NPV).
+                """
+                
                 results_text = f"""
                 PV & BESS Optimization Results
                 ==============================
@@ -835,10 +962,12 @@ def build_ui():
                 - Battery: {optimal_system['optimal_kwh']} kWh
                 - Total CAPEX: €{optimal_system['total_capex_eur']:,.0f}
                 
-                Financial Metrics:
+                Financial Metrics (Differential Analysis):
                 - Payback Period: {payback_text}
                 - 10-Year NPV: €{optimal_system['npv_eur']:,.0f}
                 - Annual O&M: €{optimal_system['om_costs']:,.0f}
+                
+                {base_case_info}
                 
                 Performance:
                 - Self-Sufficiency: {optimal_system['self_sufficiency_rate'] * 100:.1f}%
@@ -848,6 +977,9 @@ def build_ui():
                 - Grid Buy Price: €{config['grid_price_buy']:.3f}/kWh
                 - Grid Sell Price: €{config['grid_price_sell']:.3f}/kWh
                 - WACC: {config['wacc']*100:.1f}%
+                
+                Note: NPV is calculated using differential cash flows compared to the base case
+                of continuing to purchase all energy from the grid.
                 """
                 
                 st.download_button(
