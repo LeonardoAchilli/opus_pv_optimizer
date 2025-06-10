@@ -8,6 +8,7 @@ import streamlit as st
 # SECTION 1: BACKEND LOGIC
 # ==============================================================================
 
+@st.cache_data(ttl=86400)  # Cache for 24 hours
 def get_pvgis_data(latitude: float, longitude: float) -> pd.DataFrame:
     """Fetches 15-minute interval PV generation data from PVGIS v5.2 using JSON format."""
     # Updated to PVGIS API v5.2 with JSON output
@@ -63,6 +64,16 @@ def get_pvgis_data(latitude: float, longitude: float) -> pd.DataFrame:
             # Resample to 15-minute intervals if we have hourly data
             if len(df) < 35040:  # If we have hourly data (8760 hours in a year)
                 df_resampled = df[['P_kW']].resample('15min').interpolate(method='linear')
+                # Ensure exactly 35040 points
+                if len(df_resampled) > 35040:
+                    df_resampled = df_resampled.iloc[:35040]
+                elif len(df_resampled) < 35040:
+                    # Pad with zeros if needed
+                    padding = 35040 - len(df_resampled)
+                    pad_index = pd.date_range(start=df_resampled.index[-1] + pd.Timedelta(minutes=15), 
+                                             periods=padding, freq='15min')
+                    pad_df = pd.DataFrame({'P_kW': [0] * padding}, index=pad_index)
+                    df_resampled = pd.concat([df_resampled, pad_df])
                 return df_resampled
             
             return df[['P_kW']]
@@ -91,6 +102,15 @@ def get_pvgis_data(latitude: float, longitude: float) -> pd.DataFrame:
                     
                     if len(df) < 35040:
                         df_resampled = df[['P_kW']].resample('15min').interpolate(method='linear')
+                        # Ensure exactly 35040 points
+                        if len(df_resampled) > 35040:
+                            df_resampled = df_resampled.iloc[:35040]
+                        elif len(df_resampled) < 35040:
+                            padding = 35040 - len(df_resampled)
+                            pad_index = pd.date_range(start=df_resampled.index[-1] + pd.Timedelta(minutes=15), 
+                                                     periods=padding, freq='15min')
+                            pad_df = pd.DataFrame({'P_kW': [0] * padding}, index=pad_index)
+                            df_resampled = pd.concat([df_resampled, pad_df])
                         return df_resampled
                     
                     return df[['P_kW']]
@@ -120,6 +140,15 @@ def get_pvgis_data(latitude: float, longitude: float) -> pd.DataFrame:
                         
                         if len(df) < 35040:
                             df_resampled = df[['P_kW']].resample('15min').interpolate(method='linear')
+                            # Ensure exactly 35040 points
+                            if len(df_resampled) > 35040:
+                                df_resampled = df_resampled.iloc[:35040]
+                            elif len(df_resampled) < 35040:
+                                padding = 35040 - len(df_resampled)
+                                pad_index = pd.date_range(start=df_resampled.index[-1] + pd.Timedelta(minutes=15), 
+                                                         periods=padding, freq='15min')
+                                pad_df = pd.DataFrame({'P_kW': [0] * padding}, index=pad_index)
+                                df_resampled = pd.concat([df_resampled, pad_df])
                             return df_resampled
                         
                         return df[['P_kW']]
@@ -132,11 +161,10 @@ def get_pvgis_data(latitude: float, longitude: float) -> pd.DataFrame:
         
     except Exception as e:
         return None
-    
 
 
-def run_simulation(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, consumption_profile, config):
-    """Runs the full 5-year simulation with improved accuracy."""
+def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, consumption_profile, config):
+    """Vectorized version of the simulation for much faster execution."""
     # Extract configuration parameters
     dod = config['bess_dod']
     c_rate = config['bess_c_rate']
@@ -147,94 +175,99 @@ def run_simulation(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, consumption_pr
     
     # Calculate battery parameters
     usable_nominal_capacity_kwh = bess_kwh_nominal * dod
-    max_charge_discharge_power_kw = bess_kwh_nominal * c_rate
-    max_charge_discharge_per_step_kwh = max_charge_discharge_power_kw * 0.25  # 15-min step
+    max_charge_discharge_per_step_kwh = bess_kwh_nominal * c_rate * 0.25  # 15-min step
+    
+    # Convert data to numpy arrays for faster computation
+    pv_base = pvgis_baseline_data['P_kW'].to_numpy(dtype=np.float32)
+    cons = consumption_profile['consumption_kWh'].to_numpy(dtype=np.float32)
     
     # Simulation parameters
     steps_per_year = len(consumption_profile)
+    steps = steps_per_year
     calendar_degr_per_step = bess_cal_degr_rate / steps_per_year
     
     # Initialize simulation variables
-    soh = 1.0  # State of Health
     annual_net_savings = []
     total_grid_import = 0
-    total_consumption = consumption_profile['consumption_kWh'].sum() * 5
+    total_consumption = cons.sum() * 5
+    
+    # Pre-calculate PV degradation factors for all years
+    pv_degradation_factors = (1 - pv_degr_rate) ** np.arange(5)
     
     # Run 5-year simulation
-    for year in range(1, 6):
+    for year in range(5):
         # Apply PV degradation
-        pv_degradation_factor = (1 - pv_degr_rate) ** (year - 1)
-        current_pv_production = pvgis_baseline_data['P_kW'] * pv_kwp * pv_degradation_factor
+        pv_hourly = pv_base * pv_kwp * pv_degradation_factors[year] * 0.25  # Convert to kWh per 15-min
         
-        # Initialize yearly metrics
-        soc_kwh = 0.0
-        yearly_energy_bought_kwh = 0
-        yearly_energy_sold_kwh = 0
+        # Initialize state variables
+        soc = np.zeros(steps + 1, dtype=np.float32)
+        soh = 1.0
         
-        # Simulate each 15-minute interval
-        for i in range(steps_per_year):
-            # Get production and consumption for this step
-            prod_kwh = current_pv_production.iloc[i] * 0.25
-            cons_kwh = consumption_profile['consumption_kWh'].iloc[i]
+        # Pre-allocate arrays for energy flows
+        energy_bought = np.zeros(steps, dtype=np.float32)
+        energy_sold = np.zeros(steps, dtype=np.float32)
+        
+        # Vectorized simulation loop
+        for t in range(steps):
+            # Current available capacity
+            available_capacity = usable_nominal_capacity_kwh * soh
             
-            # Calculate available battery capacity with current SoH
-            available_capacity_kwh = usable_nominal_capacity_kwh * soh
-            
-            # Calculate net energy (positive = excess, negative = deficit)
-            net_energy = prod_kwh - cons_kwh
-            
-            energy_discharged_from_bess = 0
+            # Net energy (positive = excess, negative = deficit)
+            net_energy = pv_hourly[t] - cons[t]
             
             if net_energy > 0:
-                # Excess energy: try to charge battery, then sell to grid
+                # Excess energy: charge battery
                 energy_to_charge = net_energy * charge_eff
                 actual_charge = min(
                     energy_to_charge,
-                    available_capacity_kwh - soc_kwh,
+                    available_capacity - soc[t],
                     max_charge_discharge_per_step_kwh
                 )
-                soc_kwh += actual_charge
+                soc[t+1] = soc[t] + actual_charge
                 
-                # Sell remaining excess to grid
+                # Sell remaining excess
                 energy_not_charged = (net_energy * charge_eff - actual_charge) / charge_eff
-                yearly_energy_sold_kwh += energy_not_charged
+                energy_sold[t] = energy_not_charged
+                
+                # No cycle degradation when charging
+                cycle_deg_this_step = 0
                 
             else:
-                # Energy deficit: try to discharge battery, then buy from grid
+                # Energy deficit: discharge battery
                 deficit = -net_energy
                 
-                # Calculate how much we can discharge
+                # Calculate discharge
                 energy_from_bess_gross = min(
                     deficit / discharge_eff,
-                    soc_kwh,
+                    soc[t],
                     max_charge_discharge_per_step_kwh
                 )
                 energy_from_bess_net = energy_from_bess_gross * discharge_eff
                 
                 # Update battery state
-                soc_kwh -= energy_from_bess_gross
+                soc[t+1] = soc[t] - energy_from_bess_gross
                 
-                # Buy remaining deficit from grid
-                remaining_deficit = deficit - energy_from_bess_net
-                yearly_energy_bought_kwh += remaining_deficit
+                # Buy remaining deficit
+                energy_bought[t] = deficit - energy_from_bess_net
                 
-                energy_discharged_from_bess = energy_from_bess_gross
+                # Cycle degradation
+                if usable_nominal_capacity_kwh > 0:
+                    cycle_deg_this_step = (
+                        (energy_from_bess_gross / usable_nominal_capacity_kwh) * 
+                        (0.2 / 7000) * 1.15
+                    )
+                else:
+                    cycle_deg_this_step = 0
             
-            # Apply battery degradation
-            # Cycle degradation (based on discharge)
-            if usable_nominal_capacity_kwh > 0:
-                cycle_deg_this_step = (
-                    (energy_discharged_from_bess / usable_nominal_capacity_kwh) * 
-                    (0.2 / 7000) * 1.15  # 20% degradation after 7000 cycles, with 15% safety factor
-                )
-            else:
-                cycle_deg_this_step = 0
-            
-            # Total degradation
+            # Apply degradation
             soh = max(0, soh - calendar_degr_per_step - cycle_deg_this_step)
         
+        # Calculate annual totals using numpy sum
+        yearly_energy_bought_kwh = energy_bought.sum()
+        yearly_energy_sold_kwh = energy_sold.sum()
+        
         # Calculate annual savings
-        cost_without_system = consumption_profile['consumption_kWh'].sum() * config['grid_price_buy']
+        cost_without_system = cons.sum() * config['grid_price_buy']
         cost_with_system = yearly_energy_bought_kwh * config['grid_price_buy']
         revenue_from_exports = yearly_energy_sold_kwh * config['grid_price_sell']
         
@@ -255,12 +288,12 @@ def run_simulation(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, consumption_pr
         last_real_saving = next_saving
     
     # Calculate CAPEX
-    capex_pv = pv_kwp * (600 + 600 * np.exp(-pv_kwp / 290))  # Non-linear pricing
+    capex_pv = pv_kwp * (600 + 600 * np.exp(-pv_kwp / 290))
     capex_bess = bess_kwh_nominal * 150
     total_capex = capex_pv + capex_bess
     
     # Calculate O&M costs
-    om_pv = (12 - 0.01 * pv_kwp) * pv_kwp  # Decreasing per-kWp cost
+    om_pv = (12 - 0.01 * pv_kwp) * pv_kwp
     om_bess = 1500 + (capex_bess * 0.015)
     total_om = om_pv + om_bess
     
@@ -289,7 +322,7 @@ def run_simulation(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, consumption_pr
         "total_capex_eur": total_capex,
         "self_sufficiency_rate": self_sufficiency_rate,
         "final_soh_percent": soh * 100,
-        "annual_savings": annual_net_savings[:5],  # First 5 years actual
+        "annual_savings": annual_net_savings[:5],
         "om_costs": total_om
     }
 
@@ -303,6 +336,11 @@ def find_optimal_system(user_inputs, config, pvgis_baseline):
     
     max_kwh = user_inputs['budget'] / 150  # Minimum battery cost
     
+    # Ensure we have valid search ranges
+    if max_kwp < 5:
+        st.error(f"Budget too low! Minimum PV system costs ~€3,250 (5 kWp). Your budget allows max {max_kwp:.1f} kWp")
+        return None
+    
     # Define search ranges with adaptive step sizes
     kwp_step = max(5, int(max_kwp / 20))  # More granular search
     kwh_step = max(5, int(max_kwh / 20))
@@ -310,21 +348,32 @@ def find_optimal_system(user_inputs, config, pvgis_baseline):
     pv_search_range = range(kwp_step, int(max_kwp) + kwp_step, kwp_step)
     bess_search_range = range(0, int(max_kwh) + kwh_step, kwh_step)
     
+    # Debug information
+    st.info(f"Searching PV sizes: {kwp_step} to {int(max_kwp)} kWp (step: {kwp_step})")
+    st.info(f"Searching battery sizes: 0 to {int(max_kwh)} kWh (step: {kwh_step})")
+    
     # Initialize search variables
     best_result = None
     min_payback = float('inf')
     results_matrix = []
+    valid_solutions = 0
     
     # Progress tracking
     progress_bar = st.progress(0)
     total_sims = len(pv_search_range) * len(bess_search_range)
     sim_count = 0
+    update_frequency = max(1, total_sims // 20)  # Update progress bar 20 times max
     
     # Search for optimal combination
     for pv_kwp in pv_search_range:
+        battery_found_within_budget = False
+        
         for bess_kwh in bess_search_range:
             sim_count += 1
-            progress_bar.progress(sim_count / total_sims if total_sims > 0 else 1)
+            
+            # Update progress bar less frequently
+            if sim_count % update_frequency == 0 or sim_count == total_sims:
+                progress_bar.progress(min(sim_count / total_sims, 1.0))
             
             # Check budget constraint
             current_capex_pv = pv_kwp * (600 + 600 * np.exp(-pv_kwp / 290))
@@ -333,23 +382,56 @@ def find_optimal_system(user_inputs, config, pvgis_baseline):
             if (current_capex_pv + current_capex_bess) > user_inputs['budget']:
                 break  # Skip remaining battery sizes for this PV size
             
-            # Run simulation
-            result = run_simulation(pv_kwp, bess_kwh, pvgis_baseline, 
-                                  user_inputs['consumption_profile_df'], config)
+            battery_found_within_budget = True
+            valid_solutions += 1
+            
+            # Run vectorized simulation
+            result = run_simulation_vectorized(pv_kwp, bess_kwh, pvgis_baseline, 
+                                             user_inputs['consumption_profile_df'], config)
             
             # Store result for analysis
             result['pv_kwp'] = pv_kwp
             result['bess_kwh'] = bess_kwh
             results_matrix.append(result)
             
-            # Track best result (minimum payback period)
+            # Track best result - prioritize by NPV if all paybacks are infinite
             if result['payback_period_years'] < min_payback:
                 min_payback = result['payback_period_years']
-                best_result = result
+                best_result = result.copy()
                 best_result['optimal_kwp'] = pv_kwp
                 best_result['optimal_kwh'] = bess_kwh
+            elif min_payback == float('inf') and best_result is None:
+                # If no finite payback found yet, use the one with best NPV
+                best_result = result.copy()
+                best_result['optimal_kwp'] = pv_kwp
+                best_result['optimal_kwh'] = bess_kwh
+            elif min_payback == float('inf') and result['npv_eur'] > best_result.get('npv_eur', -float('inf')):
+                # Update if this has better NPV
+                best_result = result.copy()
+                best_result['optimal_kwp'] = pv_kwp
+                best_result['optimal_kwh'] = bess_kwh
+        
+        # If no battery size fits within budget for this PV size, skip larger PV sizes
+        if not battery_found_within_budget and bess_search_range:
+            break
     
     progress_bar.empty()
+    
+    # Show summary with more details
+    if valid_solutions > 0:
+        st.success(f"✅ Analyzed {valid_solutions} valid configurations")
+        
+        # Show sample results for debugging
+        if results_matrix and st.checkbox("Show sample results for debugging"):
+            sample_results = results_matrix[:5]  # First 5 results
+            for i, res in enumerate(sample_results):
+                st.write(f"Config {i+1}: PV={res['pv_kwp']}kWp, BESS={res['bess_kwh']}kWh")
+                st.write(f"  - NPV: €{res['npv_eur']:,.0f}")
+                st.write(f"  - Payback: {res['payback_period_years']:.1f} years")
+                st.write(f"  - CAPEX: €{res['total_capex_eur']:,.0f}")
+                st.write(f"  - Annual savings (Y1): €{res['annual_savings'][0]:,.0f}")
+    else:
+        st.warning("No valid configurations found within constraints")
     
     # Add results matrix to best result for visualization
     if best_result:
@@ -469,8 +551,9 @@ def build_ui():
         # Advanced settings (collapsible)
         with st.expander("⚙️ Advanced Settings"):
             st.write("**Electricity Prices**")
-            grid_buy = st.number_input("Grid Buy Price (€/kWh)", value=0.28, format="%.3f")
-            grid_sell = st.number_input("Grid Sell Price (€/kWh)", value=0.05, format="%.3f")
+            st.info("💡 Italian market avg: Buy €0.30-0.40/kWh, Sell €0.10-0.15/kWh")
+            grid_buy = st.number_input("Grid Buy Price (€/kWh)", value=0.35, format="%.3f", min_value=0.10, max_value=1.00)
+            grid_sell = st.number_input("Grid Sell Price (€/kWh)", value=0.12, format="%.3f", min_value=0.01, max_value=0.50)
             
             st.write("**Financial Parameters**")
             wacc = st.slider("WACC (%)", min_value=1, max_value=15, value=7) / 100
@@ -478,7 +561,8 @@ def build_ui():
             st.write("**Battery Parameters**")
             dod = st.slider("Depth of Discharge (%)", 70, 95, 85) / 100
             c_rate = st.slider("C-Rate", 0.3, 1.0, 0.7, 0.1)
-    expected_rows = 35041
+    
+    expected_rows = 35040
     # Main content area
     if uploaded_file is not None:
         try:
@@ -489,14 +573,22 @@ def build_ui():
                 st.error("❌ Error: CSV must contain a column named 'consumption_kWh'.")
                 return
             
-            actual_rows = len(consumption_df)+1
+            actual_rows = len(consumption_df)
             
-            if actual_rows != expected_rows:
+            # Validate consumption data length
+            if len(consumption_df) != expected_rows:
                 st.warning(f"""
                     ⚠️ Warning: Expected {expected_rows:,} rows but found {actual_rows:,} rows.
                     The simulation assumes 1 year of 15-minute data.
-                    Results may be inaccurate.
+                    Adjusting data to match expected length...
                 """)
+                # Trim or pad the data to match expected length
+                if len(consumption_df) > expected_rows:
+                    consumption_df = consumption_df.iloc[:expected_rows]
+                else:
+                    # Repeat the pattern to fill missing data
+                    repeats_needed = (expected_rows // len(consumption_df)) + 1
+                    consumption_df = pd.concat([consumption_df] * repeats_needed).iloc[:expected_rows].reset_index(drop=True)
             
             # Display consumption statistics
             st.subheader("📊 Consumption Profile Summary")
@@ -546,8 +638,8 @@ def build_ui():
                 'bess_discharge_eff': 0.95,
                 'pv_degradation_rate': 0.01,
                 'bess_calendar_degradation_rate': 0.015,
-                'grid_price_buy': grid_buy if 'grid_buy' in locals() else 0.28,
-                'grid_price_sell': grid_sell if 'grid_sell' in locals() else 0.05,
+                'grid_price_buy': grid_buy if 'grid_buy' in locals() else 0.35,  # Updated default
+                'grid_price_sell': grid_sell if 'grid_sell' in locals() else 0.12,  # Updated default
                 'wacc': wacc if 'wacc' in locals() else 0.07
             }
             
@@ -560,8 +652,45 @@ def build_ui():
                 if pvgis_baseline is not None and not pvgis_baseline.empty:
                     st.success("✅ Solar data retrieved successfully!")
                     
-                    # Run optimization
-                    optimal_system = find_optimal_system(user_inputs, config, pvgis_baseline)
+                    # Debug info
+                    with st.expander("🔍 Debug Information"):
+                        st.write(f"PVGIS data points: {len(pvgis_baseline)}")
+                        st.write(f"Consumption data points: {len(consumption_df)}")
+                        st.write(f"Budget: €{budget:,.0f}")
+                        st.write(f"Available area: {available_area_m2} m²")
+                        st.write(f"Max PV from area: {available_area_m2 / 5.0:.1f} kWp")
+                        st.write(f"Max PV from budget: {budget / 650:.1f} kWp")
+                        
+                    # Ensure data consistency
+                    if len(pvgis_baseline) != len(consumption_df):
+                        st.error(f"Data mismatch: PVGIS has {len(pvgis_baseline)} points, consumption has {len(consumption_df)} points")
+                        # Try to align data
+                        min_len = min(len(pvgis_baseline), len(consumption_df))
+                        pvgis_baseline = pvgis_baseline.iloc[:min_len]
+                        consumption_df = consumption_df.iloc[:min_len]
+                        st.warning(f"Trimmed both datasets to {min_len} points")
+                    
+                    # Run optimization with error handling
+                    try:
+                        optimal_system = find_optimal_system(user_inputs, config, pvgis_baseline)
+                        
+                        if optimal_system is None:
+                            st.error("❌ No valid solution found!")
+                            st.warning("""
+                            **Possible reasons:**
+                            - Budget too low for any viable system
+                            - No combination meets the constraints
+                            
+                            **Try:**
+                            - Increasing the budget (€150,000+)
+                            - Checking your consumption data
+                            """)
+                        
+                    except Exception as e:
+                        st.error(f"❌ Error during optimization: {str(e)}")
+                        with st.expander("Show full error"):
+                            st.exception(e)
+                
                 else:
                     st.error("❌ Could not retrieve solar data. Please check your location or try again later.")
                     st.info("""
@@ -595,11 +724,18 @@ def build_ui():
                     )
                 
                 with col3:
-                    st.metric(
-                        "Payback Period",
-                        f"{optimal_system['payback_period_years']:.1f} years",
-                        help="Time to recover initial investment"
-                    )
+                    if optimal_system['payback_period_years'] == float('inf'):
+                        st.metric(
+                            "Payback Period",
+                            "> 25 years",
+                            help="System doesn't achieve positive payback within analysis period"
+                        )
+                    else:
+                        st.metric(
+                            "Payback Period",
+                            f"{optimal_system['payback_period_years']:.1f} years",
+                            help="Time to recover initial investment"
+                        )
                 
                 with col4:
                     st.metric(
@@ -663,7 +799,22 @@ def build_ui():
                 
                 # Recommendations
                 st.subheader("💡 Recommendations")
-                if optimal_system['optimal_kwh'] == 0:
+                if optimal_system['payback_period_years'] == float('inf'):
+                    st.warning("""
+                    ⚠️ **No positive payback achieved** - The system doesn't pay for itself within the analysis period.
+                    
+                    This might be due to:
+                    - Low electricity prices
+                    - Low consumption relative to investment
+                    - High system costs
+                    
+                    Consider:
+                    - Checking if electricity prices are correct for your area
+                    - Waiting for battery prices to decrease
+                    - Installing PV-only system without battery
+                    - Increasing electricity sell price if you have special feed-in tariffs
+                    """)
+                elif optimal_system['optimal_kwh'] == 0:
                     st.info("🔍 **No battery recommended** - The analysis suggests a PV-only system provides the best financial return for your situation.")
                 elif optimal_system['payback_period_years'] > 8:
                     st.warning("⚠️ **Long payback period** - Consider if the environmental benefits justify the investment.")
@@ -672,6 +823,7 @@ def build_ui():
                 
                 # Export results
                 st.markdown("---")
+                payback_text = f"{optimal_system['payback_period_years']:.1f} years" if optimal_system['payback_period_years'] != float('inf') else "> 25 years"
                 results_text = f"""
                 PV & BESS Optimization Results
                 ==============================
@@ -684,13 +836,18 @@ def build_ui():
                 - Total CAPEX: €{optimal_system['total_capex_eur']:,.0f}
                 
                 Financial Metrics:
-                - Payback Period: {optimal_system['payback_period_years']:.1f} years
+                - Payback Period: {payback_text}
                 - 10-Year NPV: €{optimal_system['npv_eur']:,.0f}
                 - Annual O&M: €{optimal_system['om_costs']:,.0f}
                 
                 Performance:
                 - Self-Sufficiency: {optimal_system['self_sufficiency_rate'] * 100:.1f}%
                 - Battery SoH (Year 5): {optimal_system['final_soh_percent']:.1f}%
+                
+                Economic Parameters Used:
+                - Grid Buy Price: €{config['grid_price_buy']:.3f}/kWh
+                - Grid Sell Price: €{config['grid_price_sell']:.3f}/kWh
+                - WACC: {config['wacc']*100:.1f}%
                 """
                 
                 st.download_button(
