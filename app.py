@@ -220,7 +220,7 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
             
             if net_energy > 0:
                 # Excess energy: charge battery
-                energy_to_charge = net_energy * charge_eff
+                energy_to_charge = net_energy * efficiency
                 actual_charge = min(
                     energy_to_charge,
                     available_capacity - soc[t],
@@ -229,7 +229,7 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
                 soc[t+1] = soc[t] + actual_charge
                 
                 # Sell remaining excess
-                energy_not_charged = (net_energy * charge_eff - actual_charge) / charge_eff
+                energy_not_charged = (net_energy * efficiency - actual_charge) / efficiency
                 energy_sold[t] = energy_not_charged
                 
                 # No cycle degradation when charging
