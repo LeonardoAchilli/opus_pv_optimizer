@@ -169,8 +169,7 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
     # Extract configuration parameters
     dod = config['bess_dod']
     c_rate = config['bess_c_rate']
-    charge_eff = config['bess_charge_eff']
-    discharge_eff = config['bess_discharge_eff']
+    efficiency = config['bess_efficiency']
     pv_degr_rate = config['pv_degradation_rate']
     bess_cal_degr_rate = config['bess_calendar_degradation_rate']
     
