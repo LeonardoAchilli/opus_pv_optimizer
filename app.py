@@ -593,10 +593,10 @@ def build_ui():
             st.write("**Battery Parameters**")
             dod = st.slider("Depth of Discharge (%)", 70, 95, 85) / 100
             c_rate = st.slider("C-Rate", 0.3, 1.0, 0.7, 0.1)
+            bess_cycles = st.slider("Battery Life Cycles", 6000, 10000, 7000, 100)
             
             st.write("**Technical Parameters**")
-            charge_eff = st.slider("Charge Efficiency (%)", 85, 98, 95) / 100
-            discharge_eff = st.slider("Discharge Efficiency (%)", 85, 98, 95) / 100
+            efficiency = st.slider("Charge/Discharge Efficiency (%)", 85, 98, 95) / 100
             pv_degr = st.slider("PV Annual Degradation (%)", 0.2, 2.0, 1.0) / 100
             bess_cal_degr = st.slider("Battery Calendar Degradation (%/year)", 0.5, 3.0, 1.5) / 100
     
@@ -674,12 +674,12 @@ def build_ui():
             config = {
                 'bess_dod': dod if 'dod' in locals() else 0.85,
                 'bess_c_rate': c_rate if 'c_rate' in locals() else 0.7,
-                'bess_charge_eff': charge_eff if 'charge_eff' in locals() else 0.95,
-                'bess_discharge_eff': discharge_eff if 'discharge_eff' in locals() else 0.95,
+                'bess_efficiency': efficiency if 'efficiency' in locals() else 0.95,
+                'bess_cycles': bess_cycles if 'bess_cycles' in locals() else 7000,
                 'pv_degradation_rate': pv_degr if 'pv_degr' in locals() else 0.01,
                 'bess_calendar_degradation_rate': bess_cal_degr if 'bess_cal_degr' in locals() else 0.015,
-                'grid_price_buy': grid_buy if 'grid_buy' in locals() else 0.35,  # Updated default
-                'grid_price_sell': grid_sell if 'grid_sell' in locals() else 0.12,  # Updated default
+                'grid_price_buy': grid_buy if 'grid_buy' in locals() else 0.35,
+                'grid_price_sell': grid_sell if 'grid_sell' in locals() else 0.12,
                 'wacc': wacc if 'wacc' in locals() else 0.07
             }
             
@@ -706,18 +706,33 @@ def build_ui():
                         
                         st.write("1. **For each 15-minute interval:**")
                         st.code("""
-# Energy flows
-pv_production = pv_base × pv_kwp × degradation × 0.25  # kWh
-net_energy = pv_production - consumption
+# Step-by-step energy flow calculation
 
-if net_energy > 0:  # Excess
-    charge_battery = min(net_energy × charge_eff, available_capacity, max_charge_rate)
-    grid_export = net_energy - (charge_battery / charge_eff)
-    grid_import = 0
-else:  # Deficit
-    discharge_battery = min(-net_energy / discharge_eff, soc, max_discharge_rate)
-    grid_import = -net_energy - (discharge_battery × discharge_eff)
-    grid_export = 0
+# 1. Battery discharge (if consumption > production)
+if consumo > produzione:
+    kwh_scaricati = min((consumo - produzione)/efficienza, SoC(t-1), C_rate*capacity/4)
+else:
+    kwh_scaricati = 0
+
+# 2. State of Charge update
+if produzione >= consumo:
+    delta_SoC = (produzione - consumo) * efficienza
+else:
+    delta_SoC = (produzione - consumo) / efficienza
+    
+SoC = min(max(SoC(t-1) + delta_SoC, 0), kWh_netti * SoH(t-1))
+
+# 3. Grid export (excess that cannot be stored)
+if produzione > consumo:
+    immissione = max(0, SoC(t-1) + produzione - consumo - kWh_netti * SoH(t-1))
+else:
+    immissione = 0
+
+# 4. Grid import (deficit not covered by battery)
+acquisto = max(0, consumo - produzione - SoC(t-1))
+
+# 5. SoH degradation
+SoH = SoH(t-1) - calendar_deg/35040 - (kwh_scaricati(t-1)/capacity) * (0.2 * 1.15 / cycles)
 """)
                         
                         st.write("2. **Annual aggregation:**")
@@ -752,13 +767,15 @@ O&M_BESS = 1500 + (CAPEX_BESS × 0.015)  # Fixed + percentage
                         
                         st.write("6. **Degradation models:**")
                         st.code("""
-# PV degradation
+# PV degradation (annual)
 pv_output_year_n = pv_output_year_1 × (1 - pv_degradation_rate)^(n-1)
 
-# Battery degradation
-calendar_degradation_per_step = annual_rate / steps_per_year
-cycle_degradation_per_step = (discharged_energy / usable_capacity) × (0.2 / 7000) × 1.15
-soh_new = soh_old - calendar_degradation - cycle_degradation
+# Battery degradation (per step)
+calendar_degradation_per_step = annual_calendar_deg / 35040
+cycle_degradation_per_step = (kwh_scaricati / battery_capacity) × (0.2 × 1.15 / total_cycles)
+SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
+
+# Note: Cycle degradation uses discharge from PREVIOUS step (t-1)
 """)
                         
                     # Ensure data consistency
