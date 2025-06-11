@@ -241,11 +241,11 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
                 
                 # Calculate discharge
                 energy_from_bess_gross = min(
-                    deficit / discharge_eff,
+                    deficit / efficiency,
                     soc[t],
                     max_charge_discharge_per_step_kwh
                 )
-                energy_from_bess_net = energy_from_bess_gross * discharge_eff
+                energy_from_bess_net = energy_from_bess_gross * efficiency
                 
                 # Update battery state
                 soc[t+1] = soc[t] - energy_from_bess_gross
