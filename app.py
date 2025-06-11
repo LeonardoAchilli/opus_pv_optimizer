@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import io
 
 # ==============================================================================
 # SECTION 1: BACKEND LOGIC
@@ -439,10 +440,27 @@ def find_optimal_system(user_inputs, config, pvgis_baseline):
                     with col2:
                         st.write(f"**Performance:**")
                         st.write(f"- Self-sufficiency: {res['self_sufficiency_rate']*100:.1f}%")
-                        st.write(f"- Annual savings Y1: €{res['annual_savings'][0]:,.0f}")
-                        st.write(f"- Battery SoH Y5: {res['final_soh_percent']:.1f}%")
-                        if 'base_case_annual_cost' in res:
-                            st.write(f"- Base case cost: €{res['base_case_annual_cost']:,.0f}/year")
+                        if 'annual_metrics' in res and res['annual_metrics']:
+                            year1 = res['annual_metrics'][0]
+                            st.write(f"- PV Production Y1: {year1['pv_production']:,.0f} kWh")
+                            st.write(f"- Grid Import Y1: {year1['energy_bought']:,.0f} kWh")
+                            st.write(f"- Grid Export Y1: {year1['energy_sold']:,.0f} kWh")
+                    
+                    # Show Year 1 cash flow calculation
+                    if 'cash_flows' in res and len(res['cash_flows']) > 1:
+                        st.write("**Year 1 Cash Flow Breakdown:**")
+                        cf1 = res['cash_flows'][1]
+                        if 'annual_metrics' in res:
+                            m1 = res['annual_metrics'][0]
+                            base = m1['consumption'] * config['grid_price_buy']
+                            cost = m1['energy_bought'] * config['grid_price_buy']
+                            revenue = m1['energy_sold'] * config['grid_price_sell']
+                            
+                            st.write(f"Base cost: €{base:,.0f}")
+                            st.write(f"- Energy cost: €{cost:,.0f}")
+                            st.write(f"+ Energy revenue: €{revenue:,.0f}")
+                            st.write(f"- O&M: €{res['om_costs']:,.0f}")
+                            st.write(f"= Cash Flow: €{cf1:,.0f}")
     else:
         st.warning("No valid configurations found within constraints")
     
@@ -575,6 +593,12 @@ def build_ui():
             st.write("**Battery Parameters**")
             dod = st.slider("Depth of Discharge (%)", 70, 95, 85) / 100
             c_rate = st.slider("C-Rate", 0.3, 1.0, 0.7, 0.1)
+            
+            st.write("**Technical Parameters**")
+            charge_eff = st.slider("Charge Efficiency (%)", 85, 98, 95) / 100
+            discharge_eff = st.slider("Discharge Efficiency (%)", 85, 98, 95) / 100
+            pv_degr = st.slider("PV Annual Degradation (%)", 0.2, 2.0, 1.0) / 100
+            bess_cal_degr = st.slider("Battery Calendar Degradation (%/year)", 0.5, 3.0, 1.5) / 100
     
     expected_rows = 35040
     # Main content area
@@ -598,11 +622,13 @@ def build_ui():
                 """)
                 # Trim or pad the data to match expected length
                 if len(consumption_df) > expected_rows:
-                    consumption_df = consumption_df.iloc[:expected_rows]
+                    consumption_df = consumption_df.iloc[:expected_rows].copy()
+                    st.info(f"✂️ Trimmed data to {expected_rows:,} rows")
                 else:
                     # Repeat the pattern to fill missing data
                     repeats_needed = (expected_rows // len(consumption_df)) + 1
                     consumption_df = pd.concat([consumption_df] * repeats_needed).iloc[:expected_rows].reset_index(drop=True)
+                    st.info(f"📋 Repeated pattern to reach {expected_rows:,} rows")
             
             # Display consumption statistics
             st.subheader("📊 Consumption Profile Summary")
@@ -648,10 +674,10 @@ def build_ui():
             config = {
                 'bess_dod': dod if 'dod' in locals() else 0.85,
                 'bess_c_rate': c_rate if 'c_rate' in locals() else 0.7,
-                'bess_charge_eff': 0.95,
-                'bess_discharge_eff': 0.95,
-                'pv_degradation_rate': 0.01,
-                'bess_calendar_degradation_rate': 0.015,
+                'bess_charge_eff': charge_eff if 'charge_eff' in locals() else 0.95,
+                'bess_discharge_eff': discharge_eff if 'discharge_eff' in locals() else 0.95,
+                'pv_degradation_rate': pv_degr if 'pv_degr' in locals() else 0.01,
+                'bess_calendar_degradation_rate': bess_cal_degr if 'bess_cal_degr' in locals() else 0.015,
                 'grid_price_buy': grid_buy if 'grid_buy' in locals() else 0.35,  # Updated default
                 'grid_price_sell': grid_sell if 'grid_sell' in locals() else 0.12,  # Updated default
                 'wacc': wacc if 'wacc' in locals() else 0.07
@@ -667,13 +693,73 @@ def build_ui():
                     st.success("✅ Solar data retrieved successfully!")
                     
                     # Debug info
-                    with st.expander("🔍 Debug Information"):
+                    with st.expander("🔍 Debug Information & Calculation Logic"):
                         st.write(f"PVGIS data points: {len(pvgis_baseline)}")
                         st.write(f"Consumption data points: {len(consumption_df)}")
                         st.write(f"Budget: €{budget:,.0f}")
                         st.write(f"Available area: {available_area_m2} m²")
                         st.write(f"Max PV from area: {available_area_m2 / 5.0:.1f} kWp")
                         st.write(f"Max PV from budget: {budget / 650:.1f} kWp")
+                        
+                        st.markdown("---")
+                        st.write("**Simulation Logic (Step-by-Step):**")
+                        
+                        st.write("1. **For each 15-minute interval:**")
+                        st.code("""
+# Energy flows
+pv_production = pv_base × pv_kwp × degradation × 0.25  # kWh
+net_energy = pv_production - consumption
+
+if net_energy > 0:  # Excess
+    charge_battery = min(net_energy × charge_eff, available_capacity, max_charge_rate)
+    grid_export = net_energy - (charge_battery / charge_eff)
+    grid_import = 0
+else:  # Deficit
+    discharge_battery = min(-net_energy / discharge_eff, soc, max_discharge_rate)
+    grid_import = -net_energy - (discharge_battery × discharge_eff)
+    grid_export = 0
+""")
+                        
+                        st.write("2. **Annual aggregation:**")
+                        st.code("""
+annual_grid_import = sum(grid_import for all intervals)
+annual_grid_export = sum(grid_export for all intervals)
+annual_consumption = sum(consumption for all intervals)
+""")
+                        
+                        st.write("3. **Cash Flow calculation (your Excel formula):**")
+                        st.code("""
+CF[0] = -CAPEX
+CF[n] = -O&M + (grid_export × sell_price) - (grid_import × buy_price) + (consumption × buy_price)
+
+Which equals:
+CF[n] = (consumption × buy_price) - (grid_import × buy_price) + (grid_export × sell_price) - O&M
+""")
+                        
+                        st.write("4. **NPV calculation:**")
+                        st.code("NPV = Σ(CF[i] / (1 + WACC)^i) for i = 0 to 10")
+                        
+                        st.write("5. **Cost formulas used:**")
+                        st.code("""
+# CAPEX
+CAPEX_PV = pv_kwp × (600 + 600 × exp(-pv_kwp / 290))  # Non-linear pricing
+CAPEX_BESS = bess_kwh × 150  # Linear pricing
+
+# O&M
+O&M_PV = (12 - 0.01 × pv_kwp) × pv_kwp  # Economies of scale
+O&M_BESS = 1500 + (CAPEX_BESS × 0.015)  # Fixed + percentage
+""")
+                        
+                        st.write("6. **Degradation models:**")
+                        st.code("""
+# PV degradation
+pv_output_year_n = pv_output_year_1 × (1 - pv_degradation_rate)^(n-1)
+
+# Battery degradation
+calendar_degradation_per_step = annual_rate / steps_per_year
+cycle_degradation_per_step = (discharged_energy / usable_capacity) × (0.2 / 7000) × 1.15
+soh_new = soh_old - calendar_degradation - cycle_degradation
+""")
                         
                     # Ensure data consistency
                     if len(pvgis_baseline) != len(consumption_df):
