@@ -169,171 +169,213 @@ def get_pvgis_data(latitude: float, longitude: float) -> pd.DataFrame:
 
 
 def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, consumption_profile, config):
-    """Vectorized version of the simulation for much faster execution."""
+    """Vectorized simulation with exact energy flow formulas as specified."""
     # Extract configuration parameters
     dod = config['bess_dod']
     c_rate = config['bess_c_rate']
-    charge_eff = config['bess_charge_eff']
-    discharge_eff = config['bess_discharge_eff']
+    efficiency = config['bess_efficiency']  # Single efficiency for both charge and discharge
     pv_degr_rate = config['pv_degradation_rate']
-    bess_cal_degr_rate = config['bess_calendar_degradation_rate']
+    calendar_degradation = config['bess_calendar_degradation_rate']
+    tot_cycles = config['bess_cycles']
     
     # Calculate battery parameters
-    usable_nominal_capacity_kwh = bess_kwh_nominal * dod
-    max_charge_discharge_per_step_kwh = bess_kwh_nominal * c_rate * 0.25  # 15-min step
+    kwh_netti = bess_kwh_nominal * dod  # Usable capacity
+    max_charge_discharge_per_step = bess_kwh_nominal * c_rate / 4  # C-rate limit for 15-min step
     
-    # Convert data to numpy arrays for faster computation
+    # Convert data to numpy arrays
     pv_base = pvgis_baseline_data['P_kW'].to_numpy(dtype=np.float32)
     cons = consumption_profile['consumption_kWh'].to_numpy(dtype=np.float32)
     
+    # Debug: Check consumption data
+    annual_consumption = cons.sum()
+    if annual_consumption == 0:
+        st.warning(f"⚠️ Warning: Annual consumption is zero! Check consumption data.")
+        st.write(f"Consumption profile shape: {cons.shape}")
+        st.write(f"First 10 values: {cons[:10]}")
+    
+    # Calculate base case annual cost - FIXED
+    base_case_annual_cost = annual_consumption * config['grid_price_buy']
+    
     # Simulation parameters
-    steps_per_year = len(consumption_profile)
-    steps = steps_per_year
-    calendar_degr_per_step = bess_cal_degr_rate / steps_per_year
+    steps_per_year = 35040  # 96 steps/day * 365 days
     
-    # Initialize simulation variables
-    annual_net_savings = []
+    # Initialize tracking variables
+    annual_metrics = []
     total_grid_import = 0
-    total_consumption = cons.sum() * 5
+    total_consumption = annual_consumption * 5  # 5 years total
     
-    # Calculate base case annual cost once
-    base_case_annual_cost = cons.sum() * config['grid_price_buy']
-    
-    # Pre-calculate PV degradation factors for all years
+    # Pre-calculate PV degradation factors
     pv_degradation_factors = (1 - pv_degr_rate) ** np.arange(5)
     
     # Run 5-year simulation
     for year in range(5):
         # Apply PV degradation
-        pv_hourly = pv_base * pv_kwp * pv_degradation_factors[year] * 0.25  # Convert to kWh per 15-min
+        pv_production = pv_base * pv_kwp * pv_degradation_factors[year] * 0.25  # kWh per 15-min
         
-        # Initialize state variables
-        soc = np.zeros(steps + 1, dtype=np.float32)
-        soh = 1.0
+        # Initialize arrays for this year
+        soc = np.zeros(steps_per_year + 1, dtype=np.float32)
+        soh = np.zeros(steps_per_year + 1, dtype=np.float32)
+        kwh_scaricati = np.zeros(steps_per_year, dtype=np.float32)
+        kwh_caricati = np.zeros(steps_per_year, dtype=np.float32)
+        immissione = np.zeros(steps_per_year, dtype=np.float32)
+        acquisto = np.zeros(steps_per_year, dtype=np.float32)
         
-        # Pre-allocate arrays for energy flows
-        energy_bought = np.zeros(steps, dtype=np.float32)
-        energy_sold = np.zeros(steps, dtype=np.float32)
+        # Set initial SoH
+        if year == 0:
+            soh[0] = 1.0
+        else:
+            soh[0] = annual_metrics[-1]['final_soh']
         
-        # Vectorized simulation loop
-        for t in range(steps):
-            # Current available capacity
-            available_capacity = usable_nominal_capacity_kwh * soh
+        # Simulate each 15-minute step
+        for t in range(steps_per_year):
+            produzione = pv_production[t]
+            consumo = cons[t]
             
-            # Net energy (positive = excess, negative = deficit)
-            net_energy = pv_hourly[t] - cons[t]
+            # Current max SoC based on battery health
+            max_soc_current = kwh_netti * soh[t]
             
-            if net_energy > 0:
-                # Excess energy: charge battery
-                energy_to_charge = net_energy * charge_eff
-                actual_charge = min(
-                    energy_to_charge,
-                    available_capacity - soc[t],
-                    max_charge_discharge_per_step_kwh
-                )
-                soc[t+1] = soc[t] + actual_charge
-                
-                # Sell remaining excess
-                energy_not_charged = (net_energy * charge_eff - actual_charge) / charge_eff
-                energy_sold[t] = energy_not_charged
-                
-                # No cycle degradation when charging
-                cycle_deg_this_step = 0
-                
+            # 1. Calculate kWh_scaricati (battery discharge)
+            if consumo > produzione:
+                # Energy needed from battery
+                energy_deficit = (consumo - produzione) / efficiency
+                # Apply limits: available SoC and C-rate
+                kwh_scaricati[t] = min(energy_deficit, soc[t], max_charge_discharge_per_step)
             else:
-                # Energy deficit: discharge battery
-                deficit = -net_energy
-                
-                # Calculate discharge
-                energy_from_bess_gross = min(
-                    deficit / discharge_eff,
-                    soc[t],
-                    max_charge_discharge_per_step_kwh
-                )
-                energy_from_bess_net = energy_from_bess_gross * discharge_eff
-                
-                # Update battery state
-                soc[t+1] = soc[t] - energy_from_bess_gross
-                
-                # Buy remaining deficit
-                energy_bought[t] = deficit - energy_from_bess_net
-                
-                # Cycle degradation
-                if usable_nominal_capacity_kwh > 0:
-                    cycle_deg_this_step = (
-                        (energy_from_bess_gross / usable_nominal_capacity_kwh) * 
-                        (0.2 / 7000) * 1.15
-                    )
-                else:
-                    cycle_deg_this_step = 0
+                kwh_scaricati[t] = 0
             
-            # Apply degradation
-            soh = max(0, soh - calendar_degr_per_step - cycle_deg_this_step)
+            # 2. Calculate grid export BEFORE updating SoC (Immissione)
+            if produzione > consumo:
+                # Energy that cannot be stored in battery
+                excess_after_battery = soc[t] + produzione - consumo - max_soc_current
+                immissione[t] = max(0, excess_after_battery)
+            else:
+                immissione[t] = 0
+            
+            # 3. Calculate grid import (Acquisto)
+            # Formula as specified: max(0, consumo - produzione - SoC(t-1))
+            acquisto[t] = max(0, consumo - produzione - soc[t])
+            
+            # 4. Now update SoC and track energy charged
+            if produzione >= consumo:
+                # Excess energy: charge battery
+                delta_soc = (produzione - consumo) * efficiency
+                # Actual charge limited by capacity and C-rate
+                actual_charge = min(delta_soc, max_soc_current - soc[t], max_charge_discharge_per_step)
+                soc[t+1] = soc[t] + actual_charge
+                # Track energy sent to battery (before efficiency)
+                kwh_caricati[t] = actual_charge / efficiency
+            else:
+                # Deficit: discharge battery (already calculated as kwh_scaricati)
+                soc[t+1] = soc[t] - kwh_scaricati[t]
+                kwh_caricati[t] = 0
+            
+            # 5. Calculate SoH degradation
+            if t > 0:  # Use previous step's discharge for degradation
+                cycle_degradation = (kwh_scaricati[t-1] / bess_kwh_nominal) * (0.2 * 1.15 / tot_cycles)
+            else:
+                cycle_degradation = 0
+            
+            calendar_deg_per_step = calendar_degradation / steps_per_year
+            soh[t+1] = soh[t] - calendar_deg_per_step - cycle_degradation
+            soh[t+1] = max(0, soh[t+1])  # Ensure SoH doesn't go negative
         
-        # Calculate annual totals using numpy sum
-        yearly_energy_bought_kwh = energy_bought.sum()
-        yearly_energy_sold_kwh = energy_sold.sum()
+        # Calculate annual totals
+        yearly_pv_production = pv_production.sum()
+        yearly_consumption = annual_consumption  # Use the actual annual consumption
+        yearly_energy_bought = acquisto.sum()
+        yearly_energy_sold = immissione.sum()
+        yearly_battery_discharge = (kwh_scaricati * efficiency).sum()  # Energy delivered to load
+        yearly_battery_charge = kwh_caricati.sum()  # Energy sent to battery
         
-        # Calculate annual savings
-        cost_without_system = cons.sum() * config['grid_price_buy']
-        cost_with_system = yearly_energy_bought_kwh * config['grid_price_buy']
-        revenue_from_exports = yearly_energy_sold_kwh * config['grid_price_sell']
+        yearly_self_consumption = yearly_consumption - yearly_energy_bought
         
-        annual_net_savings.append(cost_without_system - cost_with_system + revenue_from_exports)
-        total_grid_import += yearly_energy_bought_kwh
+        # Store detailed metrics
+        annual_metrics.append({
+            'year': year + 1,
+            'pv_production': yearly_pv_production,
+            'consumption': yearly_consumption,
+            'energy_bought': yearly_energy_bought,
+            'energy_sold': yearly_energy_sold,
+            'energy_to_battery': yearly_battery_charge,
+            'energy_from_battery': yearly_battery_discharge,
+            'self_consumption': yearly_self_consumption,
+            'self_sufficiency': yearly_self_consumption / yearly_consumption if yearly_consumption > 0 else 0,
+            'final_soh': soh[steps_per_year],
+            'avg_soc': soc[1:steps_per_year+1].mean(),
+            'max_soc': soc[1:steps_per_year+1].max(),
+            'min_soc': soc[1:steps_per_year+1].min()
+        })
+        
+        total_grid_import += yearly_energy_bought
     
-    # Project savings for years 6-10 using CAGR
-    if len(annual_net_savings) > 1 and annual_net_savings[0] > 0:
-        cagr = (annual_net_savings[-1] / annual_net_savings[0]) ** (1 / (len(annual_net_savings) - 1)) - 1
-    else:
-        cagr = 0
-    
-    # Project future savings
-    last_real_saving = annual_net_savings[-1]
-    for _ in range(5):
-        next_saving = last_real_saving * (1 + cagr)
-        annual_net_savings.append(next_saving)
-        last_real_saving = next_saving
-    
-    # Calculate CAPEX
+    # Calculate financial metrics
     capex_pv = pv_kwp * (600 + 600 * np.exp(-pv_kwp / 290))
     capex_bess = bess_kwh_nominal * 150
     total_capex = capex_pv + capex_bess
     
-    # Calculate O&M costs
+    # O&M costs
     om_pv = (12 - 0.01 * pv_kwp) * pv_kwp
     om_bess = 1500 + (capex_bess * 0.015)
     total_om = om_pv + om_bess
     
-    # Calculate net cash flows
-    net_cash_flows = [s - total_om for s in annual_net_savings]
+    # Calculate cash flows using differential formula
+    cash_flows = [-total_capex]  # Year 0
+    
+    for metrics in annual_metrics:
+        # CF = (consumo × buy) - (energia_prelevata × buy) + (energia_immessa × sell) - O&M
+        base_cost = metrics['consumption'] * config['grid_price_buy']
+        energy_cost = metrics['energy_bought'] * config['grid_price_buy']
+        energy_revenue = metrics['energy_sold'] * config['grid_price_sell']
+        
+        annual_cf = base_cost - energy_cost + energy_revenue - total_om
+        cash_flows.append(annual_cf)
+    
+    # Project cash flows for years 6-10
+    if len(cash_flows) > 1:
+        last_cf = cash_flows[-1]
+        for _ in range(5):
+            projected_cf = last_cf * 0.97  # 3% degradation
+            cash_flows.append(projected_cf)
+            last_cf = projected_cf
     
     # Calculate NPV
     wacc = config['wacc']
-    npv = sum(net_cash_flows[i] / ((1 + wacc) ** (i + 1)) for i in range(10)) - total_capex
+    npv = sum(cash_flows[i] / ((1 + wacc) ** i) for i in range(len(cash_flows)))
     
     # Calculate payback period
-    cumulative_cash_flow = -total_capex
+    cumulative_cf = 0
     payback_period = float('inf')
-    for i, cash_flow in enumerate(net_cash_flows):
-        cumulative_cash_flow += cash_flow
-        if cumulative_cash_flow > 0:
-            payback_period = i + (1 - cumulative_cash_flow / cash_flow)
+    for i, cf in enumerate(cash_flows):
+        cumulative_cf += cf
+        if cumulative_cf > 0 and i > 0:
+            prev_cumulative = cumulative_cf - cf
+            fraction = -prev_cumulative / cf
+            payback_period = i - 1 + fraction
             break
     
-    # Calculate self-sufficiency rate
+    # Calculate base case NPV
+    base_case_npv = -sum(base_case_annual_cost / ((1 + wacc) ** (i + 1)) for i in range(10))
+    
+    # Overall self-sufficiency rate
     self_sufficiency_rate = (total_consumption - total_grid_import) / total_consumption if total_consumption > 0 else 0
     
     return {
         "npv_eur": npv,
+        "base_case_npv_eur": base_case_npv,
         "payback_period_years": payback_period,
         "total_capex_eur": total_capex,
+        "capex_pv": capex_pv,
+        "capex_bess": capex_bess,
         "self_sufficiency_rate": self_sufficiency_rate,
-        "final_soh_percent": soh * 100,
-        "annual_savings": annual_net_savings[:5],
-        "om_costs": total_om
+        "final_soh_percent": annual_metrics[-1]['final_soh'] * 100,
+        "om_costs": total_om,
+        "om_pv": om_pv,
+        "om_bess": om_bess,
+        "base_case_annual_cost": base_case_annual_cost,
+        "annual_metrics": annual_metrics,
+        "cash_flows": cash_flows,
+        "annual_consumption": annual_consumption  # Add for debugging
     }
-
 
 def find_optimal_system(user_inputs, config, pvgis_baseline):
     """Finds the optimal PV and BESS combination with improved search algorithm."""
