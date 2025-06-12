@@ -9,6 +9,10 @@ import io
 # SECTION 1: BACKEND LOGIC
 # ==============================================================================
 
+# ==============================================================================
+# SECTION 1: BACKEND LOGIC
+# ==============================================================================
+
 @st.cache_data(ttl=86400)  # Cache for 24 hours
 def get_pvgis_data(latitude: float, longitude: float) -> pd.DataFrame:
     """Fetches 15-minute interval PV generation data from PVGIS v5.2 using JSON format."""
@@ -169,7 +173,8 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
     # Extract configuration parameters
     dod = config['bess_dod']
     c_rate = config['bess_c_rate']
-    efficiency = config['bess_efficiency']
+    charge_eff = config['bess_charge_eff']
+    discharge_eff = config['bess_discharge_eff']
     pv_degr_rate = config['pv_degradation_rate']
     bess_cal_degr_rate = config['bess_calendar_degradation_rate']
     
@@ -220,7 +225,7 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
             
             if net_energy > 0:
                 # Excess energy: charge battery
-                energy_to_charge = net_energy * efficiency
+                energy_to_charge = net_energy * charge_eff
                 actual_charge = min(
                     energy_to_charge,
                     available_capacity - soc[t],
@@ -229,7 +234,7 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
                 soc[t+1] = soc[t] + actual_charge
                 
                 # Sell remaining excess
-                energy_not_charged = (net_energy * efficiency - actual_charge) / efficiency
+                energy_not_charged = (net_energy * charge_eff - actual_charge) / charge_eff
                 energy_sold[t] = energy_not_charged
                 
                 # No cycle degradation when charging
@@ -241,11 +246,11 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
                 
                 # Calculate discharge
                 energy_from_bess_gross = min(
-                    deficit / efficiency,
+                    deficit / discharge_eff,
                     soc[t],
                     max_charge_discharge_per_step_kwh
                 )
-                energy_from_bess_net = energy_from_bess_gross * efficiency
+                energy_from_bess_net = energy_from_bess_gross * discharge_eff
                 
                 # Update battery state
                 soc[t+1] = soc[t] - energy_from_bess_gross
@@ -378,7 +383,7 @@ def find_optimal_system(user_inputs, config, pvgis_baseline):
             if sim_count % update_frequency == 0 or sim_count == total_sims:
                 progress_bar.progress(min(sim_count / total_sims, 1.0))
             
-            # Check budget constraint
+            # Check budget constraint with correct CAPEX calculation
             current_capex_pv = pv_kwp * (600 + 600 * np.exp(-pv_kwp / 290))
             current_capex_bess = bess_kwh * 150
             
