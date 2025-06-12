@@ -378,21 +378,21 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
     }
 
 def find_optimal_system(user_inputs, config, pvgis_baseline):
-    """Finds the optimal PV and BESS combination with improved search algorithm."""
+    """Finds the optimal PV and BESS combination prioritizing NPV."""
     # Calculate maximum feasible sizes
-    max_kwp_from_area = user_inputs['available_area_m2'] / 5.0  # 5 m²/kWp
-    max_kwp_from_budget = user_inputs['budget'] / 650  # Minimum cost estimate
+    max_kwp_from_area = user_inputs['available_area_m2'] / 5.0
+    max_kwp_from_budget = user_inputs['budget'] / 650
     max_kwp = min(max_kwp_from_area, max_kwp_from_budget)
     
-    max_kwh = user_inputs['budget'] / 150  # Minimum battery cost
+    max_kwh = user_inputs['budget'] / 150
     
     # Ensure we have valid search ranges
     if max_kwp < 5:
         st.error(f"Budget too low! Minimum PV system costs ~€3,250 (5 kWp). Your budget allows max {max_kwp:.1f} kWp")
         return None
     
-    # Define search ranges with adaptive step sizes
-    kwp_step = max(5, int(max_kwp / 20))  # More granular search
+    # Define search ranges
+    kwp_step = max(5, int(max_kwp / 20))
     kwh_step = max(5, int(max_kwh / 20))
     
     pv_search_range = range(kwp_step, int(max_kwp) + kwp_step, kwp_step)
@@ -402,9 +402,11 @@ def find_optimal_system(user_inputs, config, pvgis_baseline):
     st.info(f"Searching PV sizes: {kwp_step} to {int(max_kwp)} kWp (step: {kwp_step})")
     st.info(f"Searching battery sizes: 0 to {int(max_kwh)} kWh (step: {kwh_step})")
     
-    # Initialize search variables
-    best_result = None
-    min_payback = float('inf')
+    # Initialize search variables - SEPARATE TRACKING FOR PV-ONLY AND PV+BESS
+    best_pv_only = None
+    best_pv_bess = None
+    best_overall = None
+    
     results_matrix = []
     valid_solutions = 0
     
@@ -412,7 +414,7 @@ def find_optimal_system(user_inputs, config, pvgis_baseline):
     progress_bar = st.progress(0)
     total_sims = len(pv_search_range) * len(bess_search_range)
     sim_count = 0
-    update_frequency = max(1, total_sims // 20)  # Update progress bar 20 times max
+    update_frequency = max(1, total_sims // 20)
     
     # Search for optimal combination
     for pv_kwp in pv_search_range:
@@ -421,45 +423,48 @@ def find_optimal_system(user_inputs, config, pvgis_baseline):
         for bess_kwh in bess_search_range:
             sim_count += 1
             
-            # Update progress bar less frequently
+            # Update progress bar
             if sim_count % update_frequency == 0 or sim_count == total_sims:
                 progress_bar.progress(min(sim_count / total_sims, 1.0))
             
-            # Check budget constraint with correct CAPEX calculation
+            # Check budget constraint
             current_capex_pv = pv_kwp * (600 + 600 * np.exp(-pv_kwp / 290))
             current_capex_bess = bess_kwh * 150
             
             if (current_capex_pv + current_capex_bess) > user_inputs['budget']:
-                break  # Skip remaining battery sizes for this PV size
+                break
             
             battery_found_within_budget = True
             valid_solutions += 1
             
-            # Run vectorized simulation
+            # Run simulation
             result = run_simulation_vectorized(pv_kwp, bess_kwh, pvgis_baseline, 
                                              user_inputs['consumption_profile_df'], config)
             
-            # Store result for analysis
+            # Store result
             result['pv_kwp'] = pv_kwp
             result['bess_kwh'] = bess_kwh
             results_matrix.append(result)
             
-            # Track best result - prioritize by NPV if all paybacks are infinite
-            if result['payback_period_years'] < min_payback:
-                min_payback = result['payback_period_years']
-                best_result = result.copy()
-                best_result['optimal_kwp'] = pv_kwp
-                best_result['optimal_kwh'] = bess_kwh
-            elif min_payback == float('inf') and best_result is None:
-                # If no finite payback found yet, use the one with best NPV
-                best_result = result.copy()
-                best_result['optimal_kwp'] = pv_kwp
-                best_result['optimal_kwh'] = bess_kwh
-            elif min_payback == float('inf') and result['npv_eur'] > best_result.get('npv_eur', -float('inf')):
-                # Update if this has better NPV
-                best_result = result.copy()
-                best_result['optimal_kwp'] = pv_kwp
-                best_result['optimal_kwh'] = bess_kwh
+            # NEW SELECTION LOGIC - PRIORITIZE NPV!
+            if bess_kwh == 0:
+                # PV-only configuration
+                if best_pv_only is None or result['npv_eur'] > best_pv_only['npv_eur']:
+                    best_pv_only = result.copy()
+                    best_pv_only['optimal_kwp'] = pv_kwp
+                    best_pv_only['optimal_kwh'] = 0
+            else:
+                # PV+BESS configuration
+                if best_pv_bess is None or result['npv_eur'] > best_pv_bess['npv_eur']:
+                    best_pv_bess = result.copy()
+                    best_pv_bess['optimal_kwp'] = pv_kwp
+                    best_pv_bess['optimal_kwh'] = bess_kwh
+            
+            # Track overall best (highest NPV regardless of battery)
+            if best_overall is None or result['npv_eur'] > best_overall['npv_eur']:
+                best_overall = result.copy()
+                best_overall['optimal_kwp'] = pv_kwp
+                best_overall['optimal_kwh'] = bess_kwh
         
         # If no battery size fits within budget for this PV size, skip larger PV sizes
         if not battery_found_within_budget and bess_search_range:
@@ -467,54 +472,73 @@ def find_optimal_system(user_inputs, config, pvgis_baseline):
     
     progress_bar.empty()
     
-    # Show summary with more details
+    # Show detailed comparison
     if valid_solutions > 0:
         st.success(f"✅ Analyzed {valid_solutions} valid configurations")
         
-        # Show sample results for debugging
-        if results_matrix and st.checkbox("Show sample results for debugging"):
-            st.write("**First 5 configurations analyzed:**")
-            for i, res in enumerate(results_matrix[:5]):
-                with st.expander(f"Config {i+1}: PV={res['pv_kwp']}kWp, BESS={res['bess_kwh']}kWh"):
-                    col1, col2 = st.columns(2)
+        # Show comparison between PV-only and PV+BESS
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.write("**🌞 Best PV-Only Configuration:**")
+            if best_pv_only:
+                st.write(f"- Size: {best_pv_only['optimal_kwp']} kWp")
+                st.write(f"- CAPEX: €{best_pv_only['total_capex_eur']:,.0f}")
+                st.write(f"- NPV: €{best_pv_only['npv_eur']:,.0f}")
+                st.write(f"- Payback: {best_pv_only['payback_period_years']:.1f} years")
+                st.write(f"- Self-sufficiency: {best_pv_only['self_sufficiency_rate']*100:.1f}%")
+        
+        with col2:
+            st.write("**🔋 Best PV+BESS Configuration:**")
+            if best_pv_bess:
+                st.write(f"- Size: {best_pv_bess['optimal_kwp']} kWp + {best_pv_bess['optimal_kwh']} kWh")
+                st.write(f"- CAPEX: €{best_pv_bess['total_capex_eur']:,.0f}")
+                st.write(f"- NPV: €{best_pv_bess['npv_eur']:,.0f}")
+                st.write(f"- Payback: {best_pv_bess['payback_period_years']:.1f} years")
+                st.write(f"- Self-sufficiency: {best_pv_bess['self_sufficiency_rate']*100:.1f}%")
+        
+        # Highlight the winner
+        st.markdown("---")
+        if best_pv_bess and best_pv_only:
+            npv_difference = best_pv_bess['npv_eur'] - best_pv_only['npv_eur']
+            if npv_difference > 0:
+                st.info(f"💡 **Battery adds €{npv_difference:,.0f} of value** (NPV increase)")
+            else:
+                st.warning(f"⚠️ **Battery reduces value by €{-npv_difference:,.0f}** (NPV decrease)")
+        
+        # Show top 10 configurations by NPV
+        if st.checkbox("📊 Show Top 10 Configurations by NPV"):
+            # Sort by NPV
+            sorted_results = sorted(results_matrix, key=lambda x: x['npv_eur'], reverse=True)[:10]
+            
+            st.write("**Top 10 Configurations (sorted by NPV):**")
+            for i, res in enumerate(sorted_results):
+                with st.expander(f"#{i+1}: PV={res['pv_kwp']}kWp, BESS={res['bess_kwh']}kWh - NPV: €{res['npv_eur']:,.0f}"):
+                    col1, col2, col3 = st.columns(3)
                     with col1:
                         st.write(f"**Financial:**")
                         st.write(f"- CAPEX: €{res['total_capex_eur']:,.0f}")
-                        st.write(f"- NPV (Differential): €{res['npv_eur']:,.0f}")
+                        st.write(f"- NPV: €{res['npv_eur']:,.0f}")
                         st.write(f"- Payback: {res['payback_period_years']:.1f} years")
-                        st.write(f"- Annual O&M: €{res['om_costs']:,.0f}")
                     with col2:
                         st.write(f"**Performance:**")
                         st.write(f"- Self-sufficiency: {res['self_sufficiency_rate']*100:.1f}%")
-                        if 'annual_metrics' in res and res['annual_metrics']:
-                            year1 = res['annual_metrics'][0]
-                            st.write(f"- PV Production Y1: {year1['pv_production']:,.0f} kWh")
-                            st.write(f"- Grid Import Y1: {year1['energy_bought']:,.0f} kWh")
-                            st.write(f"- Grid Export Y1: {year1['energy_sold']:,.0f} kWh")
-                    
-                    # Show Year 1 cash flow calculation
-                    if 'cash_flows' in res and len(res['cash_flows']) > 1:
-                        st.write("**Year 1 Cash Flow Breakdown:**")
-                        cf1 = res['cash_flows'][1]
-                        if 'annual_metrics' in res:
-                            m1 = res['annual_metrics'][0]
-                            base = m1['consumption'] * config['grid_price_buy']
-                            cost = m1['energy_bought'] * config['grid_price_buy']
-                            revenue = m1['energy_sold'] * config['grid_price_sell']
-                            
-                            st.write(f"Base cost: €{base:,.0f}")
-                            st.write(f"- Energy cost: €{cost:,.0f}")
-                            st.write(f"+ Energy revenue: €{revenue:,.0f}")
-                            st.write(f"- O&M: €{res['om_costs']:,.0f}")
-                            st.write(f"= Cash Flow: €{cf1:,.0f}")
+                        st.write(f"- Annual O&M: €{res['om_costs']:,.0f}")
+                    with col3:
+                        st.write(f"**ROI Metrics:**")
+                        roi = (res['npv_eur'] / res['total_capex_eur']) * 100
+                        st.write(f"- ROI: {roi:.1f}%")
+                        st.write(f"- NPV/CAPEX: {res['npv_eur']/res['total_capex_eur']:.2f}")
     else:
         st.warning("No valid configurations found within constraints")
     
-    # Add results matrix to best result for visualization
-    if best_result:
-        best_result['all_results'] = results_matrix
+    # Add results matrix to best result
+    if best_overall:
+        best_overall['all_results'] = results_matrix
+        best_overall['best_pv_only'] = best_pv_only
+        best_overall['best_pv_bess'] = best_pv_bess
     
-    return best_result
+    return best_overall
 
 
 def build_ui():
