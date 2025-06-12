@@ -652,7 +652,13 @@ def build_ui():
         try:
             # Read and validate consumption data
             consumption_df = pd.read_csv(uploaded_file)
-            
+            # --- CLEAN NaN IN consumption_kWh ---------------------------------
+            consumption_df['consumption_kWh'] = (
+            pd.to_numeric(consumption_df['consumption_kWh'], errors='coerce')  # stringhe→numero o NaN
+            .fillna(0)                                                       # NaN → 0 kWh
+            )
+            # -------------------------------------------------------------------
+
             if 'consumption_kWh' not in consumption_df.columns:
                 st.error("❌ Error: CSV must contain a column named 'consumption_kWh'.")
                 return
