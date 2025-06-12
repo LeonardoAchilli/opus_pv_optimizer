@@ -9,10 +9,6 @@ import io
 # SECTION 1: BACKEND LOGIC
 # ==============================================================================
 
-# ==============================================================================
-# SECTION 1: BACKEND LOGIC
-# ==============================================================================
-
 @st.cache_data(ttl=86400)  # Cache for 24 hours
 def get_pvgis_data(latitude: float, longitude: float) -> pd.DataFrame:
     """Fetches 15-minute interval PV generation data from PVGIS v5.2 using JSON format."""
@@ -252,7 +248,7 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
                 immissione[t] = 0
             
             # 3. Calculate grid import (Acquisto)
-            # Formula as specified: max(0, consumo - produzione - SoC(t-1))
+            # Energy deficit not covered by production and battery
             acquisto[t] = max(0, consumo - produzione - soc[t])
             
             # 4. Now update SoC and track energy charged
@@ -377,22 +373,85 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
         "annual_consumption": annual_consumption  # Add for debugging
     }
 
+
+def test_specific_configurations(user_inputs, config, pvgis_baseline):
+    """Test specific PV and BESS configurations as requested."""
+    test_configs = [
+        (150, 100, "Large system"),
+        (100, 50, "Medium-large system"),
+        (50, 25, "Medium system"),
+        (25, 10, "Small-medium system"),
+        (14, 0, "Small PV only"),
+        (200, 150, "Very large system"),
+        (75, 75, "Balanced medium")
+    ]
+    
+    results = []
+    st.write("### 🧪 Testing Specific Configurations")
+    
+    for pv_kwp, bess_kwh, desc in test_configs:
+        # Check if within constraints
+        capex_pv = pv_kwp * (600 + 600 * np.exp(-pv_kwp / 290))
+        capex_bess = bess_kwh * 150
+        total_capex = capex_pv + capex_bess
+        
+        if total_capex <= user_inputs['budget'] and pv_kwp <= user_inputs['available_area_m2'] / 5.0:
+            result = run_simulation_vectorized(pv_kwp, bess_kwh, pvgis_baseline, 
+                                             user_inputs['consumption_profile_df'], config)
+            
+            results.append({
+                'Configuration': f"{pv_kwp} kWp / {bess_kwh} kWh",
+                'Description': desc,
+                'CAPEX (€)': f"{total_capex:,.0f}",
+                'NPV (€)': f"{result['npv_eur']:,.0f}",
+                'Payback (years)': f"{result['payback_period_years']:.1f}" if result['payback_period_years'] != float('inf') else "> 25",
+                'Self-sufficiency (%)': f"{result['self_sufficiency_rate']*100:.1f}"
+            })
+        else:
+            constraint = "Budget" if total_capex > user_inputs['budget'] else "Area"
+            results.append({
+                'Configuration': f"{pv_kwp} kWp / {bess_kwh} kWh",
+                'Description': desc,
+                'CAPEX (€)': f"{total_capex:,.0f}",
+                'NPV (€)': f"Exceeds {constraint}",
+                'Payback (years)': "-",
+                'Self-sufficiency (%)': "-"
+            })
+    
+    # Display results table
+    import pandas as pd
+    df_results = pd.DataFrame(results)
+    st.dataframe(df_results, use_container_width=True)
+    
+    # Find configuration with best NPV among valid ones
+    valid_results = [r for r in results if "Exceeds" not in r['NPV (€)']]
+    if valid_results:
+        # Convert NPV strings back to numbers for comparison
+        for r in valid_results:
+            r['npv_numeric'] = float(r['NPV (€)'].replace(',', '').replace('€', ''))
+        
+        best_config = max(valid_results, key=lambda x: x['npv_numeric'])
+        st.success(f"✅ Best NPV: {best_config['Configuration']} with NPV = {best_config['NPV (€)']}")
+    
+    return results
+
+
 def find_optimal_system(user_inputs, config, pvgis_baseline):
-    """Finds the optimal PV and BESS combination prioritizing NPV."""
+    """Finds the optimal PV and BESS combination with improved search algorithm."""
     # Calculate maximum feasible sizes
-    max_kwp_from_area = user_inputs['available_area_m2'] / 5.0
-    max_kwp_from_budget = user_inputs['budget'] / 650
+    max_kwp_from_area = user_inputs['available_area_m2'] / 5.0  # 5 m²/kWp
+    max_kwp_from_budget = user_inputs['budget'] / 650  # Minimum cost estimate
     max_kwp = min(max_kwp_from_area, max_kwp_from_budget)
     
-    max_kwh = user_inputs['budget'] / 150
+    max_kwh = user_inputs['budget'] / 150  # Minimum battery cost
     
     # Ensure we have valid search ranges
     if max_kwp < 5:
         st.error(f"Budget too low! Minimum PV system costs ~€3,250 (5 kWp). Your budget allows max {max_kwp:.1f} kWp")
         return None
     
-    # Define search ranges
-    kwp_step = max(5, int(max_kwp / 20))
+    # Define search ranges with adaptive step sizes
+    kwp_step = max(5, int(max_kwp / 20))  # More granular search
     kwh_step = max(5, int(max_kwh / 20))
     
     pv_search_range = range(kwp_step, int(max_kwp) + kwp_step, kwp_step)
@@ -402,11 +461,9 @@ def find_optimal_system(user_inputs, config, pvgis_baseline):
     st.info(f"Searching PV sizes: {kwp_step} to {int(max_kwp)} kWp (step: {kwp_step})")
     st.info(f"Searching battery sizes: 0 to {int(max_kwh)} kWh (step: {kwh_step})")
     
-    # Initialize search variables - SEPARATE TRACKING FOR PV-ONLY AND PV+BESS
-    best_pv_only = None
-    best_pv_bess = None
-    best_overall = None
-    
+    # Initialize search variables
+    best_result = None
+    best_npv = -float('inf')  # Maximize NPV, not minimize payback!
     results_matrix = []
     valid_solutions = 0
     
@@ -414,131 +471,103 @@ def find_optimal_system(user_inputs, config, pvgis_baseline):
     progress_bar = st.progress(0)
     total_sims = len(pv_search_range) * len(bess_search_range)
     sim_count = 0
-    update_frequency = max(1, total_sims // 20)
+    update_frequency = max(1, total_sims // 20)  # Update progress bar 20 times max
     
     # Search for optimal combination
     for pv_kwp in pv_search_range:
-        battery_found_within_budget = False
-        
         for bess_kwh in bess_search_range:
             sim_count += 1
             
-            # Update progress bar
+            # Update progress bar less frequently
             if sim_count % update_frequency == 0 or sim_count == total_sims:
                 progress_bar.progress(min(sim_count / total_sims, 1.0))
             
-            # Check budget constraint
+            # Check budget constraint with correct CAPEX calculation
             current_capex_pv = pv_kwp * (600 + 600 * np.exp(-pv_kwp / 290))
             current_capex_bess = bess_kwh * 150
             
             if (current_capex_pv + current_capex_bess) > user_inputs['budget']:
-                break
+                continue  # Skip this combination but continue checking others
             
-            battery_found_within_budget = True
             valid_solutions += 1
             
-            # Run simulation
+            # Run vectorized simulation
             result = run_simulation_vectorized(pv_kwp, bess_kwh, pvgis_baseline, 
                                              user_inputs['consumption_profile_df'], config)
             
-            # Store result
+            # Store result for analysis
             result['pv_kwp'] = pv_kwp
             result['bess_kwh'] = bess_kwh
             results_matrix.append(result)
             
-            # NEW SELECTION LOGIC - PRIORITIZE NPV!
-            if bess_kwh == 0:
-                # PV-only configuration
-                if best_pv_only is None or result['npv_eur'] > best_pv_only['npv_eur']:
-                    best_pv_only = result.copy()
-                    best_pv_only['optimal_kwp'] = pv_kwp
-                    best_pv_only['optimal_kwh'] = 0
-            else:
-                # PV+BESS configuration
-                if best_pv_bess is None or result['npv_eur'] > best_pv_bess['npv_eur']:
-                    best_pv_bess = result.copy()
-                    best_pv_bess['optimal_kwp'] = pv_kwp
-                    best_pv_bess['optimal_kwh'] = bess_kwh
-            
-            # Track overall best (highest NPV regardless of battery)
-            if best_overall is None or result['npv_eur'] > best_overall['npv_eur']:
-                best_overall = result.copy()
-                best_overall['optimal_kwp'] = pv_kwp
-                best_overall['optimal_kwh'] = bess_kwh
-        
-        # If no battery size fits within budget for this PV size, skip larger PV sizes
-        if not battery_found_within_budget and bess_search_range:
-            break
+            # Track best result by NPV (primary metric)
+            if result['npv_eur'] > best_npv:
+                best_npv = result['npv_eur']
+                best_result = result.copy()
+                best_result['optimal_kwp'] = pv_kwp
+                best_result['optimal_kwh'] = bess_kwh
     
     progress_bar.empty()
     
-    # Show detailed comparison
+    # Show summary with more details
     if valid_solutions > 0:
         st.success(f"✅ Analyzed {valid_solutions} valid configurations")
+        st.info(f"🎯 **Optimization criterion**: Maximizing NPV (Net Present Value)")
         
-        # Show comparison between PV-only and PV+BESS
-        col1, col2 = st.columns(2)
+        # Show best NPV found
+        if best_result:
+            st.write(f"**Best configuration found:**")
+            st.write(f"- PV: {best_result['optimal_kwp']} kWp")
+            st.write(f"- Battery: {best_result['optimal_kwh']} kWh") 
+            st.write(f"- NPV: €{best_result['npv_eur']:,.0f}")
+            st.write(f"- Payback: {best_result['payback_period_years']:.1f} years" if best_result['payback_period_years'] != float('inf') else "- Payback: > 25 years")
         
-        with col1:
-            st.write("**🌞 Best PV-Only Configuration:**")
-            if best_pv_only:
-                st.write(f"- Size: {best_pv_only['optimal_kwp']} kWp")
-                st.write(f"- CAPEX: €{best_pv_only['total_capex_eur']:,.0f}")
-                st.write(f"- NPV: €{best_pv_only['npv_eur']:,.0f}")
-                st.write(f"- Payback: {best_pv_only['payback_period_years']:.1f} years")
-                st.write(f"- Self-sufficiency: {best_pv_only['self_sufficiency_rate']*100:.1f}%")
-        
-        with col2:
-            st.write("**🔋 Best PV+BESS Configuration:**")
-            if best_pv_bess:
-                st.write(f"- Size: {best_pv_bess['optimal_kwp']} kWp + {best_pv_bess['optimal_kwh']} kWh")
-                st.write(f"- CAPEX: €{best_pv_bess['total_capex_eur']:,.0f}")
-                st.write(f"- NPV: €{best_pv_bess['npv_eur']:,.0f}")
-                st.write(f"- Payback: {best_pv_bess['payback_period_years']:.1f} years")
-                st.write(f"- Self-sufficiency: {best_pv_bess['self_sufficiency_rate']*100:.1f}%")
-        
-        # Highlight the winner
-        st.markdown("---")
-        if best_pv_bess and best_pv_only:
-            npv_difference = best_pv_bess['npv_eur'] - best_pv_only['npv_eur']
-            if npv_difference > 0:
-                st.info(f"💡 **Battery adds €{npv_difference:,.0f} of value** (NPV increase)")
-            else:
-                st.warning(f"⚠️ **Battery reduces value by €{-npv_difference:,.0f}** (NPV decrease)")
-        
-        # Show top 10 configurations by NPV
-        if st.checkbox("📊 Show Top 10 Configurations by NPV"):
-            # Sort by NPV
-            sorted_results = sorted(results_matrix, key=lambda x: x['npv_eur'], reverse=True)[:10]
-            
-            st.write("**Top 10 Configurations (sorted by NPV):**")
-            for i, res in enumerate(sorted_results):
-                with st.expander(f"#{i+1}: PV={res['pv_kwp']}kWp, BESS={res['bess_kwh']}kWh - NPV: €{res['npv_eur']:,.0f}"):
-                    col1, col2, col3 = st.columns(3)
+        # Show sample results for debugging
+        if results_matrix and st.checkbox("Show sample results for debugging"):
+            st.write("**First 5 configurations analyzed:**")
+            for i, res in enumerate(results_matrix[:5]):
+                with st.expander(f"Config {i+1}: PV={res['pv_kwp']}kWp, BESS={res['bess_kwh']}kWh"):
+                    col1, col2 = st.columns(2)
                     with col1:
                         st.write(f"**Financial:**")
                         st.write(f"- CAPEX: €{res['total_capex_eur']:,.0f}")
-                        st.write(f"- NPV: €{res['npv_eur']:,.0f}")
+                        st.write(f"- NPV (Differential): €{res['npv_eur']:,.0f}")
                         st.write(f"- Payback: {res['payback_period_years']:.1f} years")
+                        st.write(f"- Annual O&M: €{res['om_costs']:,.0f}")
                     with col2:
                         st.write(f"**Performance:**")
                         st.write(f"- Self-sufficiency: {res['self_sufficiency_rate']*100:.1f}%")
-                        st.write(f"- Annual O&M: €{res['om_costs']:,.0f}")
-                    with col3:
-                        st.write(f"**ROI Metrics:**")
-                        roi = (res['npv_eur'] / res['total_capex_eur']) * 100
-                        st.write(f"- ROI: {roi:.1f}%")
-                        st.write(f"- NPV/CAPEX: {res['npv_eur']/res['total_capex_eur']:.2f}")
+                        st.write(f"- NPV: €{res['npv_eur']:,.0f}")
+                        st.write(f"- Payback: {res['payback_period_years']:.1f} years" if res['payback_period_years'] != float('inf') else "- Payback: > 25 years")
+                        if 'annual_metrics' in res and res['annual_metrics']:
+                            year1 = res['annual_metrics'][0]
+                            st.write(f"- PV Production Y1: {year1['pv_production']:,.0f} kWh")
+                            st.write(f"- Grid Import Y1: {year1['energy_bought']:,.0f} kWh")
+                            st.write(f"- Grid Export Y1: {year1['energy_sold']:,.0f} kWh")
+                    
+                    # Show Year 1 cash flow calculation
+                    if 'cash_flows' in res and len(res['cash_flows']) > 1:
+                        st.write("**Year 1 Cash Flow Breakdown:**")
+                        cf1 = res['cash_flows'][1]
+                        if 'annual_metrics' in res:
+                            m1 = res['annual_metrics'][0]
+                            base = m1['consumption'] * config['grid_price_buy']
+                            cost = m1['energy_bought'] * config['grid_price_buy']
+                            revenue = m1['energy_sold'] * config['grid_price_sell']
+                            
+                            st.write(f"Base cost: €{base:,.0f}")
+                            st.write(f"- Energy cost: €{cost:,.0f}")
+                            st.write(f"+ Energy revenue: €{revenue:,.0f}")
+                            st.write(f"- O&M: €{res['om_costs']:,.0f}")
+                            st.write(f"= Cash Flow: €{cf1:,.0f}")
     else:
         st.warning("No valid configurations found within constraints")
     
-    # Add results matrix to best result
-    if best_overall:
-        best_overall['all_results'] = results_matrix
-        best_overall['best_pv_only'] = best_pv_only
-        best_overall['best_pv_bess'] = best_pv_bess
+    # Add results matrix to best result for visualization
+    if best_result:
+        best_result['all_results'] = results_matrix
     
-    return best_overall
+    return best_result
 
 
 def build_ui():
@@ -567,6 +596,8 @@ def build_ui():
         ### Find the perfect solar + battery system for your needs
         This tool optimizes Photovoltaic (PV) and Battery Energy Storage System (BESS) sizing 
         based on your consumption data, location, and budget constraints.
+        
+        **🎯 Optimization Goal**: Maximize NPV (Net Present Value) over 10 years
     """)
     
     # Sidebar inputs
@@ -651,6 +682,16 @@ def build_ui():
         
         # Advanced settings (collapsible)
         with st.expander("⚙️ Advanced Settings"):
+            st.write("**Test Options**")
+            consumption_multiplier = st.slider(
+                "Consumption Multiplier (for testing)", 
+                min_value=0.1, 
+                max_value=10.0, 
+                value=1.0, 
+                step=0.1,
+                help="Multiply consumption data by this factor to test different scenarios"
+            )
+            
             st.write("**Electricity Prices**")
             st.info("💡 Italian market avg: Buy €0.30-0.40/kWh, Sell €0.10-0.15/kWh")
             grid_buy = st.number_input("Grid Buy Price (€/kWh)", value=0.35, format="%.3f", min_value=0.10, max_value=1.00)
@@ -700,6 +741,12 @@ def build_ui():
                     consumption_df = pd.concat([consumption_df] * repeats_needed).iloc[:expected_rows].reset_index(drop=True)
                     st.info(f"📋 Repeated pattern to reach {expected_rows:,} rows")
             
+            # Apply consumption multiplier if set
+            if 'consumption_multiplier' in locals() and consumption_multiplier != 1.0:
+                consumption_df = consumption_df.copy()
+                consumption_df['consumption_kWh'] = consumption_df['consumption_kWh'] * consumption_multiplier
+                st.warning(f"⚠️ Consumption multiplied by {consumption_multiplier}x for testing")
+            
             # Display consumption statistics
             st.subheader("📊 Consumption Profile Summary")
             col1, col2, col3, col4 = st.columns(4)
@@ -733,7 +780,13 @@ def build_ui():
             return
         
         # Run optimization button
-        if st.button("🚀 Find Optimal System", type="primary", use_container_width=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            run_optimization = st.button("🚀 Find Optimal System", type="primary", use_container_width=True)
+        with col2:
+            test_configs = st.button("🧪 Test Specific Configs", use_container_width=True)
+        
+        if run_optimization or test_configs:
             # Prepare inputs
             user_inputs = {
                 "budget": budget,
@@ -762,20 +815,28 @@ def build_ui():
                 if pvgis_baseline is not None and not pvgis_baseline.empty:
                     st.success("✅ Solar data retrieved successfully!")
                     
-                    # Debug info
-                    with st.expander("🔍 Debug Information & Calculation Logic"):
-                        st.write(f"PVGIS data points: {len(pvgis_baseline)}")
-                        st.write(f"Consumption data points: {len(consumption_df)}")
-                        st.write(f"Budget: €{budget:,.0f}")
-                        st.write(f"Available area: {available_area_m2} m²")
-                        st.write(f"Max PV from area: {available_area_m2 / 5.0:.1f} kWp")
-                        st.write(f"Max PV from budget: {budget / 650:.1f} kWp")
-                        
+                    # Run specific configuration tests if requested
+                    if test_configs:
+                        test_results = test_specific_configurations(user_inputs, config, pvgis_baseline)
+                        st.info("💡 Use these results to verify the optimization algorithm is working correctly")
                         st.markdown("---")
-                        st.write("**Simulation Logic (Step-by-Step):**")
-                        
-                        st.write("1. **For each 15-minute interval:**")
-                        st.code("""
+                    
+                    # Continue with optimization if requested
+                    if run_optimization:
+                        # Debug info
+                        with st.expander("🔍 Debug Information & Calculation Logic"):
+                            st.write(f"PVGIS data points: {len(pvgis_baseline)}")
+                            st.write(f"Consumption data points: {len(consumption_df)}")
+                            st.write(f"Budget: €{budget:,.0f}")
+                            st.write(f"Available area: {available_area_m2} m²")
+                            st.write(f"Max PV from area: {available_area_m2 / 5.0:.1f} kWp")
+                            st.write(f"Max PV from budget: {budget / 650:.1f} kWp")
+                            
+                            st.markdown("---")
+                            st.write("**Simulation Logic (Step-by-Step):**")
+                            
+                            st.write("1. **For each 15-minute interval:**")
+                            st.code("""
 # Step-by-step energy flow calculation
 
 # 1. Battery discharge (if consumption > production)
@@ -799,33 +860,33 @@ else:
     immissione = 0
 
 # 4. Grid import (deficit not covered by battery)
-acquisto = max(0, consumo - produzione - SoC(t-1))
+acquisto = max(0, consumo - produzione - SoC(t))
 
 # 5. SoH degradation
 SoH = SoH(t-1) - calendar_deg/35040 - (kwh_scaricati(t-1)/capacity) * (0.2 * 1.15 / cycles)
 """)
-                        
-                        st.write("2. **Annual aggregation:**")
-                        st.code("""
+                            
+                            st.write("2. **Annual aggregation:**")
+                            st.code("""
 annual_grid_import = sum(grid_import for all intervals)
 annual_grid_export = sum(grid_export for all intervals)
 annual_consumption = sum(consumption for all intervals)
 """)
-                        
-                        st.write("3. **Cash Flow calculation (your Excel formula):**")
-                        st.code("""
+                            
+                            st.write("3. **Cash Flow calculation (your Excel formula):**")
+                            st.code("""
 CF[0] = -CAPEX
 CF[n] = -O&M + (grid_export × sell_price) - (grid_import × buy_price) + (consumption × buy_price)
 
 Which equals:
 CF[n] = (consumption × buy_price) - (grid_import × buy_price) + (grid_export × sell_price) - O&M
 """)
-                        
-                        st.write("4. **NPV calculation:**")
-                        st.code("NPV = Σ(CF[i] / (1 + WACC)^i) for i = 0 to 10")
-                        
-                        st.write("5. **Cost formulas used:**")
-                        st.code("""
+                            
+                            st.write("4. **NPV calculation:**")
+                            st.code("NPV = Σ(CF[i] / (1 + WACC)^i) for i = 0 to 10")
+                            
+                            st.write("5. **Cost formulas used:**")
+                            st.code("""
 # CAPEX
 CAPEX_PV = pv_kwp × (600 + 600 × exp(-pv_kwp / 290))  # Non-linear pricing
 CAPEX_BESS = bess_kwh × 150  # Linear pricing
@@ -834,9 +895,9 @@ CAPEX_BESS = bess_kwh × 150  # Linear pricing
 O&M_PV = (12 - 0.01 × pv_kwp) × pv_kwp  # Economies of scale
 O&M_BESS = 1500 + (CAPEX_BESS × 0.015)  # Fixed + percentage
 """)
-                        
-                        st.write("6. **Degradation models:**")
-                        st.code("""
+                            
+                            st.write("6. **Degradation models:**")
+                            st.code("""
 # PV degradation (annual)
 pv_output_year_n = pv_output_year_1 × (1 - pv_degradation_rate)^(n-1)
 
@@ -847,36 +908,36 @@ SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
 
 # Note: Cycle degradation uses discharge from PREVIOUS step (t-1)
 """)
-                        
-                    # Ensure data consistency
-                    if len(pvgis_baseline) != len(consumption_df):
-                        st.error(f"Data mismatch: PVGIS has {len(pvgis_baseline)} points, consumption has {len(consumption_df)} points")
-                        # Try to align data
-                        min_len = min(len(pvgis_baseline), len(consumption_df))
-                        pvgis_baseline = pvgis_baseline.iloc[:min_len]
-                        consumption_df = consumption_df.iloc[:min_len]
-                        st.warning(f"Trimmed both datasets to {min_len} points")
-                    
-                    # Run optimization with error handling
-                    try:
-                        optimal_system = find_optimal_system(user_inputs, config, pvgis_baseline)
-                        
-                        if optimal_system is None:
-                            st.error("❌ No valid solution found!")
-                            st.warning("""
-                            **Possible reasons:**
-                            - Budget too low for any viable system
-                            - No combination meets the constraints
                             
-                            **Try:**
-                            - Increasing the budget (€150,000+)
-                            - Checking your consumption data
-                            """)
+                        # Ensure data consistency
+                        if len(pvgis_baseline) != len(consumption_df):
+                            st.error(f"Data mismatch: PVGIS has {len(pvgis_baseline)} points, consumption has {len(consumption_df)} points")
+                            # Try to align data
+                            min_len = min(len(pvgis_baseline), len(consumption_df))
+                            pvgis_baseline = pvgis_baseline.iloc[:min_len]
+                            consumption_df = consumption_df.iloc[:min_len]
+                            st.warning(f"Trimmed both datasets to {min_len} points")
                         
-                    except Exception as e:
-                        st.error(f"❌ Error during optimization: {str(e)}")
-                        with st.expander("Show full error"):
-                            st.exception(e)
+                        # Run optimization with error handling
+                        try:
+                            optimal_system = find_optimal_system(user_inputs, config, pvgis_baseline)
+                            
+                            if optimal_system is None:
+                                st.error("❌ No valid solution found!")
+                                st.warning("""
+                                **Possible reasons:**
+                                - Budget too low for any viable system
+                                - No combination meets the constraints
+                                
+                                **Try:**
+                                - Increasing the budget (€150,000+)
+                                - Checking your consumption data
+                                """)
+                            
+                        except Exception as e:
+                            st.error(f"❌ Error during optimization: {str(e)}")
+                            with st.expander("Show full error"):
+                                st.exception(e)
                 
                 else:
                     st.error("❌ Could not retrieve solar data. Please check your location or try again later.")
