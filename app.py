@@ -996,72 +996,63 @@ SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
                     )
                 
                 # Annual savings chart
-                if 'annual_savings' in optimal_system:
+                  # Annual savings e cash flow analysis
+                if 'cash_flows' in optimal_system and len(optimal_system['cash_flows']) > 1:
+                    # La metrica dei risparmi ora usa i cash flow. CF[0] è il CAPEX, CF[1] è il primo anno.
+                    year_1_net_benefit = optimal_system['cash_flows'][1] 
+                    year_5_net_benefit = optimal_system['cash_flows'][5]
+
                     with col2:
                         st.metric(
-                            "Year 1 Savings",
-                            f"€{optimal_system['annual_savings'][0]:,.0f}",
-                            f"+€{optimal_system['annual_savings'][4] - optimal_system['annual_savings'][0]:,.0f} by Year 5"
+                            "Year 1 Net Benefit",
+                            f"€{year_1_net_benefit:,.0f}",
+                            f"{year_5_net_benefit - year_1_net_benefit:+,_} vs Year 5"
                         )
-                    
-                    # Savings progression with cash flow visualization
+
+                    # Visualizzazione dei flussi di cassa
                     with st.expander("📊 View Cash Flow Analysis"):
-                        # Create cash flow data
-                        years = list(range(0, 11))
-                        differential_cf = [-optimal_system['total_capex_eur']]  # Year 0
-                        cumulative_cf = [-optimal_system['total_capex_eur']]
+                        # I cash_flows sono già calcolati per 10 anni (11 elementi: anno 0 + anni 1-10)
+                        cf_data = optimal_system['cash_flows']
                         
-                        # Years 1-5 (actual data)
-                        for i in range(5):
-                            annual_cf = optimal_system['annual_savings'][i] - optimal_system['om_costs']
-                            differential_cf.append(annual_cf)
-                            cumulative_cf.append(cumulative_cf[-1] + annual_cf)
+                        # Crea DataFrame per la visualizzazione
+                        years = list(range(0, len(cf_data)))
+                        cumulative_cf = np.cumsum(cf_data)
                         
-                        # Years 6-10 (projected)
-                        last_cf = differential_cf[-1]
-                        for i in range(5):
-                            # Simple projection
-                            projected_cf = last_cf * 0.98  # 2% degradation
-                            differential_cf.append(projected_cf)
-                            cumulative_cf.append(cumulative_cf[-1] + projected_cf)
-                            last_cf = projected_cf
-                        
-                        # Create DataFrame for visualization
                         cf_df = pd.DataFrame({
                             'Year': years,
-                            'Annual Cash Flow (€)': differential_cf,
+                            'Annual Cash Flow (€)': cf_data,
                             'Cumulative Cash Flow (€)': cumulative_cf
-                        })
-                        
-                        # Display table
-                        st.write("**Differential Cash Flow Analysis:**")
+                        }).set_index('Year')
+
+                        st.write("**Differential Cash Flow Analysis (10 Years):**")
                         st.dataframe(
                             cf_df.style.format({
-                                'Annual Cash Flow (€)': '{:,.0f}',
-                                'Cumulative Cash Flow (€)': '{:,.0f}'
+                                'Annual Cash Flow (€)': '€{:,.0f}',
+                                'Cumulative Cash Flow (€)': '€{:,.0f}'
                             }),
                             use_container_width=True
                         )
-                        
-                        # Line chart comparing cumulative costs
+
                         st.line_chart(
-                            cf_df.set_index('Year')['Cumulative Cash Flow (€)'],
+                            cf_df['Cumulative Cash Flow (€)'],
                             height=300
                         )
                         st.caption("Cumulative cash flow showing payback period (when line crosses zero)")
-                        
-                        # Key metrics
+
+                        # Metriche chiave
                         st.write("**Key Financial Metrics:**")
                         col1, col2, col3 = st.columns(3)
                         with col1:
-                            st.write(f"Total investment: €{optimal_system['total_capex_eur']:,.0f}")
+                            st.metric("Total Investment", f"€{optimal_system['total_capex_eur']:,.0f}")
                         with col2:
-                            st.write(f"Avg annual benefit: €{sum(differential_cf[1:6])/5:,.0f}")
+                            # Calcola il beneficio medio sui primi 5 anni operativi (da indice 1 a 5)
+                            avg_benefit = sum(cf_data[1:6])/5
+                            st.metric("Avg Annual Benefit (Y1-5)", f"€{avg_benefit:,.0f}")
                         with col3:
                             if optimal_system['payback_period_years'] != float('inf'):
-                                st.write(f"Break-even: Year {optimal_system['payback_period_years']:.1f}")
+                                st.metric("Break-even Point", f"{optimal_system['payback_period_years']:.1f} years")
                             else:
-                                st.write("Break-even: > 10 years")
+                                st.metric("Break-even Point", "> 10 years")
                 
                 # Recommendations
                 st.subheader("💡 Recommendations")
