@@ -658,17 +658,17 @@ def build_ui():
         
         # PV Production Data
         st.subheader("2. PV Production Data")
-        st.info("""
-            📁 Upload a CSV file with PV production data for 1 kWp system.
-            - 35,040 rows (15-min intervals for 1 year)
+        st.markdown("""
+            📁 **Upload PV production baseline (1 kWp)**
+            - 35,040 rows (15-min intervals)
             - Values in kW for 1 kWp system
-            - Can have any column header
         """)
         
         pv_file = st.file_uploader(
             "Upload PV production data (CSV)",
             type="csv",
-            help="CSV with 35,040 rows of PV production for 1 kWp"
+            help="CSV with 35,040 rows of PV production for 1 kWp",
+            key="pv_upload"
         )
         
         # Show sample PV data format
@@ -719,7 +719,8 @@ pv_production_kw
                     label="📥 Download Sample PV Data (1 kWp)",
                     data=csv,
                     file_name="sample_pv_production_1kwp.csv",
-                    mime="text/csv"
+                    mime="text/csv",
+                    key="download_pv_sample"
                 )
                 
                 # Show preview
@@ -732,11 +733,68 @@ pv_production_kw
         
         # Consumption Profile
         st.subheader("3. Consumption Profile")
+        st.markdown("""
+            📁 **Upload consumption data**
+            - Column named 'consumption_kWh'
+            - 35,040 rows (15-min intervals)
+        """)
+        
         consumption_file = st.file_uploader(
             "Upload consumption data (CSV)",
             type="csv",
-            help="CSV with 'consumption_kWh' column and 35,040 rows"
+            help="CSV with 'consumption_kWh' column and 35,040 rows",
+            key="consumption_upload"
         )
+        
+        # Sample consumption data generator
+        with st.expander("📋 Generate Sample Consumption Data"):
+            st.code("""
+consumption_kWh
+0.125
+0.130
+0.128
+...
+(35,040 rows total)
+            """)
+            
+            if st.button("📊 Generate Sample Consumption Data"):
+                # Generate realistic consumption profile
+                hours = np.arange(0, 8760, 0.25)  # 15-min intervals for a year
+                
+                # Base load + daily pattern + seasonal variation + noise
+                base_load = 0.3
+                daily_pattern = 0.4 * np.sin((hours % 24 - 6) * np.pi / 12) ** 2
+                seasonal_pattern = 0.2 * np.cos((hours / 8760) * 2 * np.pi)
+                noise = np.random.normal(0, 0.05, len(hours))
+                
+                consumption = np.maximum(0, base_load + daily_pattern + seasonal_pattern + noise)
+                
+                sample_df = pd.DataFrame({
+                    'consumption_kWh': consumption[:35040]  # Ensure exactly 35040 rows
+                })
+                
+                # Scale to realistic annual consumption (e.g., 10,000 kWh/year)
+                current_annual = sample_df['consumption_kWh'].sum()
+                target_annual = 10000  # kWh
+                sample_df['consumption_kWh'] = sample_df['consumption_kWh'] * (target_annual / current_annual)
+                
+                csv = sample_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Sample Consumption Data",
+                    data=csv,
+                    file_name="sample_consumption_data.csv",
+                    mime="text/csv",
+                    key="download_consumption_sample"
+                )
+                
+                # Show preview
+                st.write("**Preview (first day):**")
+                fig_data = pd.DataFrame({
+                    'Hour': np.arange(0, 24, 0.25),
+                    'Consumption (kWh)': sample_df['consumption_kWh'].iloc[:96]
+                })
+                st.line_chart(fig_data.set_index('Hour'))
+                st.info(f"Annual consumption: {sample_df['consumption_kWh'].sum():.0f} kWh")
         
         # Advanced settings
         with st.expander("⚙️ Advanced Settings"):
