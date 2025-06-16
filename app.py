@@ -1213,7 +1213,7 @@ CF[n] = (consumption * buy_price) - (grid_import * buy_price) + (grid_export * s
                             st.code("""
 # CAPEX
 CAPEX_PV = pv_kwp * (600 + 600 * exp(-pv_kwp / 290))  # Non-linear pricing
-CAPEX_BESS = bess_kwh × 150  # Linear pricing
+CAPEX_BESS = bess_kwh * 150  # Linear pricing
 
 # O&M
 O&M_PV = (12 - 0.01 * pv_kwp) * pv_kwp  # Economies of scale
