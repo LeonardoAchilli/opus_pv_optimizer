@@ -4,7 +4,6 @@ import pandas as pd
 import requests
 import streamlit as st
 import io
-import zipfile
 
 # ==============================================================================
 # SECTION 1: BACKEND LOGIC
@@ -165,7 +164,7 @@ def get_pvgis_data(latitude: float, longitude: float) -> pd.DataFrame:
         return None
 
 
-def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, consumption_profile, config, export_details=False):
+def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, consumption_profile, config):
     """Vectorized simulation with exact energy flow formulas as specified."""
     # Extract configuration parameters
     dod = config['bess_dod']
@@ -203,10 +202,6 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
     
     # Pre-calculate PV degradation factors
     pv_degradation_factors = (1 - pv_degr_rate) ** np.arange(5)
-    
-    # Store detailed timestep data if requested
-    if export_details:
-        timestep_data = []
     
     # Run 5-year simulation
     for year in range(5):
@@ -279,21 +274,6 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
             calendar_deg_per_step = calendar_degradation / steps_per_year
             soh[t+1] = soh[t] - calendar_deg_per_step - cycle_degradation
             soh[t+1] = max(0, soh[t+1])  # Ensure SoH doesn't go negative
-            
-            # Store timestep data if requested
-            if export_details and t % 96 == 0:  # Store daily data to reduce size
-                timestep_data.append({
-                    'year': year + 1,
-                    'day': t // 96 + 1,
-                    'pv_production_kwh': pv_production[t:t+96].sum(),
-                    'consumption_kwh': cons[t:t+96].sum(),
-                    'battery_charge_kwh': kwh_caricati[t:t+96].sum(),
-                    'battery_discharge_kwh': (kwh_scaricati[t:t+96] * efficiency).sum(),
-                    'grid_import_kwh': acquisto[t:t+96].sum(),
-                    'grid_export_kwh': immissione[t:t+96].sum(),
-                    'avg_soc_kwh': soc[t:t+96].mean(),
-                    'soh_percent': soh[t] * 100
-                })
         
         # Calculate annual totals
         yearly_pv_production = pv_production.sum()
@@ -375,7 +355,7 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
     # Overall self-sufficiency rate
     self_sufficiency_rate = (total_consumption - total_grid_import) / total_consumption if total_consumption > 0 else 0
     
-    result = {
+    return {
         "npv_eur": npv,
         "base_case_npv_eur": base_case_npv,
         "payback_period_years": payback_period,
@@ -392,226 +372,6 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
         "cash_flows": cash_flows,
         "annual_consumption": annual_consumption  # Add for debugging
     }
-    
-    if export_details:
-        result["timestep_data"] = timestep_data
-    
-    return result
-
-
-def export_detailed_calculations(optimal_system, config, pv_kwp, bess_kwh):
-    """Export detailed calculations to multiple CSV files."""
-    
-    # 1. Annual Summary CSV
-    annual_data = []
-    for i, metrics in enumerate(optimal_system['annual_metrics']):
-        year_idx = metrics['year']
-        
-        # Financial calculations for this year
-        base_cost = metrics['consumption'] * config['grid_price_buy']
-        energy_cost = metrics['energy_bought'] * config['grid_price_buy']
-        energy_revenue = metrics['energy_sold'] * config['grid_price_sell']
-        net_energy_cost = energy_cost - energy_revenue
-        savings = base_cost - net_energy_cost
-        
-        annual_data.append({
-            'Year': year_idx,
-            'PV_Production_kWh': metrics['pv_production'],
-            'Consumption_kWh': metrics['consumption'],
-            'Grid_Import_kWh': metrics['energy_bought'],
-            'Grid_Export_kWh': metrics['energy_sold'],
-            'Battery_Charge_kWh': metrics['energy_to_battery'],
-            'Battery_Discharge_kWh': metrics['energy_from_battery'],
-            'Self_Consumption_kWh': metrics['self_consumption'],
-            'Self_Sufficiency_%': metrics['self_sufficiency'] * 100,
-            'Battery_SoH_%': metrics['final_soh'] * 100,
-            'Base_Cost_EUR': base_cost,
-            'Energy_Buy_Cost_EUR': energy_cost,
-            'Energy_Sell_Revenue_EUR': energy_revenue,
-            'Net_Energy_Cost_EUR': net_energy_cost,
-            'O&M_Cost_EUR': optimal_system['om_costs'],
-            'Annual_Savings_EUR': savings,
-            'Cash_Flow_EUR': optimal_system['cash_flows'][year_idx] if year_idx < len(optimal_system['cash_flows']) else 0
-        })
-    
-    annual_df = pd.DataFrame(annual_data)
-    
-    # 2. Financial Details CSV
-    financial_data = []
-    
-    # CAPEX breakdown
-    financial_data.append({
-        'Category': 'CAPEX',
-        'Item': 'PV System',
-        'Formula': f'{pv_kwp} × (600 + 600 × exp(-{pv_kwp}/290))',
-        'Value_EUR': optimal_system['capex_pv']
-    })
-    financial_data.append({
-        'Category': 'CAPEX',
-        'Item': 'Battery System',
-        'Formula': f'{bess_kwh} × 150',
-        'Value_EUR': optimal_system['capex_bess']
-    })
-    financial_data.append({
-        'Category': 'CAPEX',
-        'Item': 'Total CAPEX',
-        'Formula': 'PV + Battery',
-        'Value_EUR': optimal_system['total_capex_eur']
-    })
-    
-    # O&M breakdown
-    financial_data.append({
-        'Category': 'O&M (Annual)',
-        'Item': 'PV O&M',
-        'Formula': f'(12 - 0.01 × {pv_kwp}) × {pv_kwp}',
-        'Value_EUR': optimal_system['om_pv']
-    })
-    financial_data.append({
-        'Category': 'O&M (Annual)',
-        'Item': 'Battery O&M',
-        'Formula': f'1500 + ({optimal_system["capex_bess"]} × 0.015)',
-        'Value_EUR': optimal_system['om_bess']
-    })
-    financial_data.append({
-        'Category': 'O&M (Annual)',
-        'Item': 'Total O&M',
-        'Formula': 'PV O&M + Battery O&M',
-        'Value_EUR': optimal_system['om_costs']
-    })
-    
-    # NPV calculation details
-    cumulative_cf = 0
-    for i, cf in enumerate(optimal_system['cash_flows']):
-        cumulative_cf += cf
-        discount_factor = 1 / ((1 + config['wacc']) ** i)
-        discounted_cf = cf * discount_factor
-        
-        financial_data.append({
-            'Category': f'Cash Flow Year {i}',
-            'Item': 'Annual Cash Flow',
-            'Formula': 'Base Cost - Energy Cost + Energy Revenue - O&M' if i > 0 else 'Initial Investment',
-            'Value_EUR': cf
-        })
-        financial_data.append({
-            'Category': f'Cash Flow Year {i}',
-            'Item': 'Discount Factor',
-            'Formula': f'1/(1+{config["wacc"]})^{i}',
-            'Value_EUR': discount_factor
-        })
-        financial_data.append({
-            'Category': f'Cash Flow Year {i}',
-            'Item': 'Discounted Cash Flow',
-            'Formula': f'{cf:.2f} × {discount_factor:.4f}',
-            'Value_EUR': discounted_cf
-        })
-        financial_data.append({
-            'Category': f'Cash Flow Year {i}',
-            'Item': 'Cumulative Cash Flow',
-            'Formula': 'Sum of all previous cash flows',
-            'Value_EUR': cumulative_cf
-        })
-    
-    financial_data.append({
-        'Category': 'Final Results',
-        'Item': 'NPV',
-        'Formula': 'Sum of all discounted cash flows',
-        'Value_EUR': optimal_system['npv_eur']
-    })
-    financial_data.append({
-        'Category': 'Final Results',
-        'Item': 'Payback Period',
-        'Formula': 'Year when cumulative CF > 0',
-        'Value_EUR': optimal_system['payback_period_years']
-    })
-    
-    financial_df = pd.DataFrame(financial_data)
-    
-    # 3. Configuration Parameters CSV
-    config_data = []
-    config_data.append({'Parameter': 'PV_Size_kWp', 'Value': pv_kwp, 'Unit': 'kWp'})
-    config_data.append({'Parameter': 'Battery_Size_kWh', 'Value': bess_kwh, 'Unit': 'kWh'})
-    config_data.append({'Parameter': 'Battery_DoD', 'Value': config['bess_dod'] * 100, 'Unit': '%'})
-    config_data.append({'Parameter': 'Battery_C_Rate', 'Value': config['bess_c_rate'], 'Unit': 'C'})
-    config_data.append({'Parameter': 'Battery_Efficiency', 'Value': config['bess_efficiency'] * 100, 'Unit': '%'})
-    config_data.append({'Parameter': 'Battery_Cycles', 'Value': config['bess_cycles'], 'Unit': 'cycles'})
-    config_data.append({'Parameter': 'PV_Degradation_Rate', 'Value': config['pv_degradation_rate'] * 100, 'Unit': '%/year'})
-    config_data.append({'Parameter': 'Battery_Calendar_Degradation', 'Value': config['bess_calendar_degradation_rate'] * 100, 'Unit': '%/year'})
-    config_data.append({'Parameter': 'Grid_Buy_Price', 'Value': config['grid_price_buy'], 'Unit': 'EUR/kWh'})
-    config_data.append({'Parameter': 'Grid_Sell_Price', 'Value': config['grid_price_sell'], 'Unit': 'EUR/kWh'})
-    config_data.append({'Parameter': 'WACC', 'Value': config['wacc'] * 100, 'Unit': '%'})
-    config_data.append({'Parameter': 'Annual_Consumption', 'Value': optimal_system['annual_consumption'], 'Unit': 'kWh'})
-    
-    config_df = pd.DataFrame(config_data)
-    
-    # 4. Daily timestep data if available
-    timestep_df = None
-    if 'timestep_data' in optimal_system and optimal_system['timestep_data']:
-        timestep_df = pd.DataFrame(optimal_system['timestep_data'])
-    
-    return annual_df, financial_df, config_df, timestep_df
-
-
-def create_calculation_report_zip(annual_df, financial_df, config_df, timestep_df=None):
-    """Create a ZIP file containing all calculation reports."""
-    zip_buffer = io.BytesIO()
-    
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        # Add annual summary
-        csv_buffer = io.StringIO()
-        annual_df.to_csv(csv_buffer, index=False)
-        zip_file.writestr('01_annual_summary.csv', csv_buffer.getvalue())
-        
-        # Add financial details
-        csv_buffer = io.StringIO()
-        financial_df.to_csv(csv_buffer, index=False)
-        zip_file.writestr('02_financial_calculations.csv', csv_buffer.getvalue())
-        
-        # Add configuration
-        csv_buffer = io.StringIO()
-        config_df.to_csv(csv_buffer, index=False)
-        zip_file.writestr('03_configuration_parameters.csv', csv_buffer.getvalue())
-        
-        # Add timestep data if available
-        if timestep_df is not None:
-            csv_buffer = io.StringIO()
-            timestep_df.to_csv(csv_buffer, index=False)
-            zip_file.writestr('04_daily_timestep_data.csv', csv_buffer.getvalue())
-        
-        # Add README
-        readme_content = """
-PV & BESS Optimization - Detailed Calculations Report
-=====================================================
-
-This ZIP file contains detailed calculations for the optimal PV + Battery system configuration.
-
-Files included:
-1. 01_annual_summary.csv - Annual energy flows and financial summary
-2. 02_financial_calculations.csv - Detailed financial calculations including CAPEX, O&M, and NPV
-3. 03_configuration_parameters.csv - All input parameters used in the simulation
-4. 04_daily_timestep_data.csv - Daily aggregated energy flows (if exported)
-
-Key formulas used:
-- CAPEX PV = kWp × (600 + 600 × exp(-kWp/290))
-- CAPEX Battery = kWh × 150
-- O&M PV = (12 - 0.01 × kWp) × kWp
-- O&M Battery = 1500 + (CAPEX_Battery × 0.015)
-- Cash Flow = Base Cost - Energy Cost + Energy Revenue - O&M
-- NPV = Σ(Cash Flow[i] / (1 + WACC)^i)
-
-Energy flow calculation (per 15-minute interval):
-1. Battery discharge = min((consumption - production)/efficiency, SoC, C_rate*capacity/4)
-2. Grid export = max(0, SoC + production - consumption - battery_capacity*SoH)
-3. Grid import = max(0, consumption - production - SoC)
-4. SoC update based on energy balance
-5. SoH degradation based on cycling and calendar aging
-
-Generated on: {}
-        """.format(pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'))
-        
-        zip_file.writestr('README.txt', readme_content)
-    
-    zip_buffer.seek(0)
-    return zip_buffer
 
 
 def test_specific_configurations(user_inputs, config, pvgis_baseline):
@@ -659,6 +419,7 @@ def test_specific_configurations(user_inputs, config, pvgis_baseline):
             })
     
     # Display results table
+    import pandas as pd
     df_results = pd.DataFrame(results)
     st.dataframe(df_results, use_container_width=True)
     
@@ -831,11 +592,6 @@ def build_ui():
     """, unsafe_allow_html=True)
     
     st.title("⚡ Optimal PV & BESS Sizing Calculator")
-    
-    # Check if we have previous results in session
-    if 'optimal_system' in st.session_state:
-        st.info("ℹ️ Previous optimization results are available. You can scroll down to see them or run a new optimization.")
-    
     st.markdown("""
         ### Find the perfect solar + battery system for your needs
         This tool optimizes Photovoltaic (PV) and Battery Energy Storage System (BESS) sizing 
@@ -954,10 +710,6 @@ def build_ui():
             efficiency = st.slider("Charge/Discharge Efficiency (%)", 85, 98, 95) / 100
             pv_degr = st.slider("PV Annual Degradation (%)", 0.2, 2.0, 1.0) / 100
             bess_cal_degr = st.slider("Battery Calendar Degradation (%/year)", 0.5, 3.0, 1.5) / 100
-            
-            st.write("**Export Options**")
-            export_daily_data = st.checkbox("Export daily timestep data", value=False, 
-                                          help="Include daily aggregated data in the export (increases file size)")
     
     expected_rows = 35040
     # Main content area
@@ -1034,13 +786,7 @@ def build_ui():
         with col2:
             test_configs = st.button("🧪 Test Specific Configs", use_container_width=True)
         
-        # Add button to show previous results if available
-        if 'optimal_system' in st.session_state and not (run_optimization or test_configs):
-            st.markdown("---")
-            if st.button("📊 Show Previous Results", use_container_width=True):
-                st.session_state['show_previous_results'] = True
-        
-        if run_optimization or test_configs or st.session_state.get('show_previous_results', False):
+        if run_optimization or test_configs:
             # Prepare inputs
             user_inputs = {
                 "budget": budget,
@@ -1061,106 +807,36 @@ def build_ui():
             }
             
             # Run optimization
-            # Run optimization
             optimal_system = None
-            with st.spinner("🔄 Fetching solar data and running optimization."):
-                # 1) scarico i dati PVGIS
+            with st.spinner('🔄 Fetching solar data and running optimization...'):
+                # Get PVGIS data
                 pvgis_baseline = get_pvgis_data(lat, lon)
-
+                
                 if pvgis_baseline is not None and not pvgis_baseline.empty:
                     st.success("✅ Solar data retrieved successfully!")
-
-                    # 2) eventuale test di configurazioni pre-definite
+                    
+                    # Run specific configuration tests if requested
                     if test_configs:
-                        test_results = test_specific_configurations(
-                            user_inputs, config, pvgis_baseline
-                        )
-                        st.info(
-                            "💡 Use these results to verify the optimization algorithm is working correctly"
-                        )
+                        test_results = test_specific_configurations(user_inputs, config, pvgis_baseline)
+                        st.info("💡 Use these results to verify the optimization algorithm is working correctly")
                         st.markdown("---")
-
-                    # 3) eseguo la vera ottimizzazione
+                    
+                    # Continue with optimization if requested
                     if run_optimization:
-                        # — DEBUG ―───────────────────────────────────────────────
-                        with st.expander(
-                            "🔍 Debug Information & Calculation Logic"
-                        ):
+                        # Debug info
+                        with st.expander("🔍 Debug Information & Calculation Logic"):
                             st.write(f"PVGIS data points: {len(pvgis_baseline)}")
                             st.write(f"Consumption data points: {len(consumption_df)}")
                             st.write(f"Budget: €{budget:,.0f}")
                             st.write(f"Available area: {available_area_m2} m²")
-                            st.write(
-                                f"Max PV from area: {available_area_m2/5.0:.1f} kWp"
-                            )
-                            st.write(
-                                f"Max PV from budget: {budget/650:.1f} kWp"
-                            )
+                            st.write(f"Max PV from area: {available_area_m2 / 5.0:.1f} kWp")
+                            st.write(f"Max PV from budget: {budget / 650:.1f} kWp")
+                            
                             st.markdown("---")
                             st.write("**Simulation Logic (Step-by-Step):**")
-                            # (… qui rimangono invariati gli st.code con gli
-                            #  snippet esplicativi …)
-                        # — END DEBUG ―───────────────────────────────────────────
-
-                        # assicuro che i dataset abbiano la stessa lunghezza
-                        if len(pvgis_baseline) != len(consumption_df):
-                            st.error(
-                                f"Data mismatch: PVGIS has {len(pvgis_baseline)} points, "
-                                f"consumption has {len(consumption_df)} points"
-                            )
-                            min_len = min(len(pvgis_baseline), len(consumption_df))
-                            pvgis_baseline = pvgis_baseline.iloc[:min_len]
-                            consumption_df = consumption_df.iloc[:min_len]
-                            st.warning(f"Trimmed both datasets to {min_len} points")
-
-                        # blocco principale con gestione degli errori
-                        try:
-                            optimal_system = find_optimal_system(
-                                user_inputs, config, pvgis_baseline
-                            )
-
-                            if optimal_system is None:
-                                st.error("❌ No valid solution found!")
-                                st.warning(
-                                    """
-**Possible reasons**
-- budget troppo basso per un sistema minimo
-- nessuna combinazione rispetta i vincoli impostati
-
-**Prova a:**
-- aumentare il budget (≥ 150 k€)
-- verificare il profilo di consumo
-"""
-                                )
-                            else:
-                                # salvo in session_state per uso successivo / export
-                                st.session_state["optimal_system"] = optimal_system
-                                st.session_state["config"] = config
-                                st.session_state["pvgis_baseline"] = pvgis_baseline
-                                st.session_state["user_inputs"] = user_inputs
-                                st.session_state["export_daily_data"] = (
-                                    export_daily_data if export_daily_data else False
-                                )
-
-                        except Exception as e:
-                            st.error(f"❌ Error during optimization: {e}")
-                            with st.expander("Show full error"):
-                                st.exception(e)
-
-                else:
-                    st.error(
-                        "❌ Could not retrieve solar data. "
-                        "Please check your location or try again later."
-                    )
-                    st.info(
-                        """
-💡 **Tips**
-- PVGIS copre Europa, Africa e buona parte dell’Asia
-- Americhe e Oceania non sono coperte
-- Prova coordinate come: Roma (41.9 N 12.5 E), Berlino (52.5 N 13.4 E)
-"""
-                    )
-
+                            
+                            st.write("1. **For each 15-minute interval:**")
+                            st.code("""
 # Step-by-step energy flow calculation
 
 # 1. Battery discharge (if consumption > production)
@@ -1200,10 +876,10 @@ annual_consumption = sum(consumption for all intervals)
                             st.write("3. **Cash Flow calculation (your Excel formula):**")
                             st.code("""
 CF[0] = -CAPEX
-CF[n] = -O&M + (grid_export * sell_price) - (grid_import * buy_price) + (consumption * buy_price)
+CF[n] = -O&M + (grid_export × sell_price) - (grid_import × buy_price) + (consumption × buy_price)
 
 Which equals:
-CF[n] = (consumption * buy_price) - (grid_import * buy_price) + (grid_export * sell_price) - O&M
+CF[n] = (consumption × buy_price) - (grid_import × buy_price) + (grid_export × sell_price) - O&M
 """)
                             
                             st.write("4. **NPV calculation:**")
@@ -1212,22 +888,22 @@ CF[n] = (consumption * buy_price) - (grid_import * buy_price) + (grid_export * s
                             st.write("5. **Cost formulas used:**")
                             st.code("""
 # CAPEX
-CAPEX_PV = pv_kwp * (600 + 600 * exp(-pv_kwp / 290))  # Non-linear pricing
-CAPEX_BESS = bess_kwh * 150  # Linear pricing
+CAPEX_PV = pv_kwp × (600 + 600 × exp(-pv_kwp / 290))  # Non-linear pricing
+CAPEX_BESS = bess_kwh × 150  # Linear pricing
 
 # O&M
-O&M_PV = (12 - 0.01 * pv_kwp) * pv_kwp  # Economies of scale
-O&M_BESS = 1500 + (CAPEX_BESS * 0.015)  # Fixed + percentage
+O&M_PV = (12 - 0.01 × pv_kwp) × pv_kwp  # Economies of scale
+O&M_BESS = 1500 + (CAPEX_BESS × 0.015)  # Fixed + percentage
 """)
                             
                             st.write("6. **Degradation models:**")
                             st.code("""
 # PV degradation (annual)
-pv_output_year_n = pv_output_year_1 * (1 - pv_degradation_rate)^(n-1)
+pv_output_year_n = pv_output_year_1 × (1 - pv_degradation_rate)^(n-1)
 
 # Battery degradation (per step)
 calendar_degradation_per_step = annual_calendar_deg / 35040
-cycle_degradation_per_step = (kwh_scaricati / battery_capacity) * (0.2 * 1.15 / total_cycles)
+cycle_degradation_per_step = (kwh_scaricati / battery_capacity) × (0.2 × 1.15 / total_cycles)
 SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
 
 # Note: Cycle degradation uses discharge from PREVIOUS step (t-1)
@@ -1254,30 +930,15 @@ SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
                                 - No combination meets the constraints
                                 
                                 **Try:**
-                                - Increasing the budget (150,000+)
+                                - Increasing the budget (€150,000+)
                                 - Checking your consumption data
                                 """)
-                            else:
-                                # Save all necessary data to session state for export
-                                st.session_state['optimal_system'] = optimal_system
-                                st.session_state['config'] = config
-                                st.session_state['pvgis_baseline'] = pvgis_baseline
-                                st.session_state['user_inputs'] = user_inputs
-                                st.session_state['export_daily_data'] = 'export_daily_data' in locals() and export_daily_data
                             
                         except Exception as e:
                             st.error(f"❌ Error during optimization: {str(e)}")
                             with st.expander("Show full error"):
                                 st.exception(e)
-                    else:
-                        st.error("❌ Could not retrieve solar data. Please check your location or try again later.")
-                        st.info("""
-                        💡 **Tips:**
-                        - PVGIS covers Europe, Africa, and most of Asia
-                        - Americas and Oceania are not covered
-                        - Try coordinates like: Rome (41.9, 12.5), Berlin (52.5, 13.4), Cairo (30.0, 31.2)
-                        """)
-                    
+                
                 else:
                     st.error("❌ Could not retrieve solar data. Please check your location or try again later.")
                     st.info("""
@@ -1287,15 +948,8 @@ SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
                     - Try coordinates like: Rome (41.9, 12.5), Berlin (52.5, 13.4), Cairo (30.0, 31.2)
                     """)
             
-            # Display results - check session state first
-            if optimal_system or ('optimal_system' in st.session_state and st.session_state['optimal_system']):
-                # Use from session state if available
-                if 'optimal_system' in st.session_state:
-                    optimal_system = st.session_state['optimal_system']
-                    config = st.session_state['config']
-                    pvgis_baseline = st.session_state['pvgis_baseline']
-                    user_inputs = st.session_state['user_inputs']
-                
+            # Display results
+            if optimal_system:
                 st.success("✅ Optimization Complete!")
                 st.markdown("---")
                 
@@ -1437,7 +1091,7 @@ SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
                         st.metric(
                             "Year 1 Net Benefit",
                             f"€{year_1_net_benefit:,.0f}",
-                            f"{year_5_net_benefit - year_1_net_benefit:+,.0f} vs Year 5"
+                            f"{year_5_net_benefit - year_1_net_benefit:+,_} vs Year 5"
                         )
 
                     # Visualizzazione dei flussi di cassa
@@ -1484,86 +1138,6 @@ SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
                                 st.metric("Break-even Point", f"{optimal_system['payback_period_years']:.1f} years")
                             else:
                                 st.metric("Break-even Point", "> 10 years")
-                
-                # Export detailed calculations - NEW SECTION
-                st.markdown("---")
-                st.subheader("📊 Export Detailed Calculations")
-                
-                # Check if we need to regenerate the report
-                export_details = st.checkbox("Include daily timestep data in export", 
-                                           value=st.session_state.get('export_daily_data', False),
-                                           help="This will increase file size but provide more granular data",
-                                           key="export_details_checkbox")
-                
-                # Generate report if not already in session state or if settings changed
-                if ('calculation_report_zip' not in st.session_state or 
-                    st.session_state.get('last_export_details', None) != export_details):
-                    
-                    with st.spinner("Generating detailed report..."):
-                        # Re-run simulation with export details if needed
-                        if export_details:
-                            detailed_result = run_simulation_vectorized(
-                                optimal_system['optimal_kwp'], 
-                                optimal_system['optimal_kwh'], 
-                                pvgis_baseline,
-                                user_inputs['consumption_profile_df'], 
-                                config, 
-                                export_details=True
-                            )
-                        else:
-                            detailed_result = optimal_system
-                        
-                        # Generate CSV files
-                        annual_df, financial_df, config_df, timestep_df = export_detailed_calculations(
-                            detailed_result, config, 
-                            optimal_system['optimal_kwp'], 
-                            optimal_system['optimal_kwh']
-                        )
-                        
-                        # Create ZIP file
-                        zip_buffer = create_calculation_report_zip(
-                            annual_df, financial_df, config_df, timestep_df
-                        )
-                        
-                        # Save to session state
-                        st.session_state['calculation_report_zip'] = zip_buffer.getvalue()
-                        st.session_state['last_export_details'] = export_details
-                        st.session_state['annual_df'] = annual_df
-                        st.session_state['financial_df'] = financial_df
-                        st.session_state['config_df'] = config_df
-                
-                # Download button (always show if report is available)
-                if 'calculation_report_zip' in st.session_state:
-                    col1, col2 = st.columns([2, 3])
-                    with col1:
-                        st.download_button(
-                            label="📥 Download Detailed Calculations (ZIP)",
-                            data=st.session_state['calculation_report_zip'],
-                            file_name=f"pv_bess_calculations_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                            mime="application/zip",
-                            help="Contains annual summary, financial calculations, configuration parameters, and optionally daily data",
-                            key="download_detailed_calcs"
-                        )
-                    with col2:
-                        st.info("Click to download all calculation details in CSV format")
-                    
-                    # Show preview of the data
-                    if 'annual_df' in st.session_state:
-                        with st.expander("📋 Preview calculation data"):
-                            tab1, tab2, tab3 = st.tabs(["Annual Summary", "Financial Details", "Configuration"])
-                            
-                            with tab1:
-                                st.write("**Annual Energy Flows and Financial Summary:**")
-                                st.dataframe(st.session_state['annual_df'], use_container_width=True)
-                            
-                            with tab2:
-                                st.write("**Detailed Financial Calculations:**")
-                                st.dataframe(st.session_state['financial_df'].head(20), use_container_width=True)
-                                st.caption("Showing first 20 rows. Full data in downloaded file.")
-                            
-                            with tab3:
-                                st.write("**Configuration Parameters Used:**")
-                                st.dataframe(st.session_state['config_df'], use_container_width=True)
                 
                 # Recommendations
                 st.subheader("💡 Recommendations")
@@ -1634,11 +1208,10 @@ SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
                 """
                 
                 st.download_button(
-                    label="📥 Download Results Summary",
+                    label="📥 Download Results",
                     data=results_text,
                     file_name=f"pv_bess_optimization_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                    mime="text/plain",
-                    key="download_summary"
+                    mime="text/plain"
                 )
             
     else:
