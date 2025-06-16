@@ -831,6 +831,11 @@ def build_ui():
     """, unsafe_allow_html=True)
     
     st.title("⚡ Optimal PV & BESS Sizing Calculator")
+    
+    # Check if we have previous results in session
+    if 'optimal_system' in st.session_state:
+        st.info("ℹ️ Previous optimization results are available. You can scroll down to see them or run a new optimization.")
+    
     st.markdown("""
         ### Find the perfect solar + battery system for your needs
         This tool optimizes Photovoltaic (PV) and Battery Energy Storage System (BESS) sizing 
@@ -1029,7 +1034,13 @@ def build_ui():
         with col2:
             test_configs = st.button("🧪 Test Specific Configs", use_container_width=True)
         
-        if run_optimization or test_configs:
+        # Add button to show previous results if available
+        if 'optimal_system' in st.session_state and not (run_optimization or test_configs):
+            st.markdown("---")
+            if st.button("📊 Show Previous Results", use_container_width=True):
+                st.session_state['show_previous_results'] = True
+        
+        if run_optimization or test_configs or st.session_state.get('show_previous_results', False):
             # Prepare inputs
             user_inputs = {
                 "budget": budget,
@@ -1054,18 +1065,18 @@ def build_ui():
             with st.spinner('🔄 Fetching solar data and running optimization...'):
                 # Get PVGIS data
                 pvgis_baseline = get_pvgis_data(lat, lon)
-                
-                if pvgis_baseline is not None and not pvgis_baseline.empty:
-                    st.success("✅ Solar data retrieved successfully!")
                     
-                    # Run specific configuration tests if requested
-                    if test_configs:
-                        test_results = test_specific_configurations(user_inputs, config, pvgis_baseline)
-                        st.info("💡 Use these results to verify the optimization algorithm is working correctly")
-                        st.markdown("---")
-                    
-                    # Continue with optimization if requested
-                    if run_optimization:
+                    if pvgis_baseline is not None and not pvgis_baseline.empty:
+                        st.success("✅ Solar data retrieved successfully!")
+                        
+                        # Run specific configuration tests if requested
+                        if test_configs:
+                            test_results = test_specific_configurations(user_inputs, config, pvgis_baseline)
+                            st.info("💡 Use these results to verify the optimization algorithm is working correctly")
+                            st.markdown("---")
+                        
+                        # Continue with optimization if requested
+                        if run_optimization:
                         # Debug info
                         with st.expander("🔍 Debug Information & Calculation Logic"):
                             st.write(f"PVGIS data points: {len(pvgis_baseline)}")
@@ -1176,12 +1187,27 @@ SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
                                 - Increasing the budget (€150,000+)
                                 - Checking your consumption data
                                 """)
+                            else:
+                                # Save all necessary data to session state for export
+                                st.session_state['optimal_system'] = optimal_system
+                                st.session_state['config'] = config
+                                st.session_state['pvgis_baseline'] = pvgis_baseline
+                                st.session_state['user_inputs'] = user_inputs
+                                st.session_state['export_daily_data'] = 'export_daily_data' in locals() and export_daily_data
                             
                         except Exception as e:
                             st.error(f"❌ Error during optimization: {str(e)}")
                             with st.expander("Show full error"):
                                 st.exception(e)
-                
+                    else:
+                        st.error("❌ Could not retrieve solar data. Please check your location or try again later.")
+                        st.info("""
+                        💡 **Tips:**
+                        - PVGIS covers Europe, Africa, and most of Asia
+                        - Americas and Oceania are not covered
+                        - Try coordinates like: Rome (41.9, 12.5), Berlin (52.5, 13.4), Cairo (30.0, 31.2)
+                        """)
+                    
                 else:
                     st.error("❌ Could not retrieve solar data. Please check your location or try again later.")
                     st.info("""
@@ -1191,8 +1217,15 @@ SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
                     - Try coordinates like: Rome (41.9, 12.5), Berlin (52.5, 13.4), Cairo (30.0, 31.2)
                     """)
             
-            # Display results
-            if optimal_system:
+            # Display results - check session state first
+            if optimal_system or ('optimal_system' in st.session_state and st.session_state['optimal_system']):
+                # Use from session state if available
+                if 'optimal_system' in st.session_state:
+                    optimal_system = st.session_state['optimal_system']
+                    config = st.session_state['config']
+                    pvgis_baseline = st.session_state['pvgis_baseline']
+                    user_inputs = st.session_state['user_inputs']
+                
                 st.success("✅ Optimization Complete!")
                 st.markdown("---")
                 
@@ -1386,67 +1419,81 @@ SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
                 st.markdown("---")
                 st.subheader("📊 Export Detailed Calculations")
                 
+                # Check if we need to regenerate the report
                 export_details = st.checkbox("Include daily timestep data in export", 
-                                           value='export_daily_data' in locals() and export_daily_data,
-                                           help="This will increase file size but provide more granular data")
+                                           value=st.session_state.get('export_daily_data', False),
+                                           help="This will increase file size but provide more granular data",
+                                           key="export_details_checkbox")
                 
-                # Generate report directly without button to avoid state loss
-                with st.spinner("Generating detailed report..."):
-                    # Re-run simulation with export details if needed
-                    if export_details:
-                        detailed_result = run_simulation_vectorized(
+                # Generate report if not already in session state or if settings changed
+                if ('calculation_report_zip' not in st.session_state or 
+                    st.session_state.get('last_export_details', None) != export_details):
+                    
+                    with st.spinner("Generating detailed report..."):
+                        # Re-run simulation with export details if needed
+                        if export_details:
+                            detailed_result = run_simulation_vectorized(
+                                optimal_system['optimal_kwp'], 
+                                optimal_system['optimal_kwh'], 
+                                pvgis_baseline,
+                                user_inputs['consumption_profile_df'], 
+                                config, 
+                                export_details=True
+                            )
+                        else:
+                            detailed_result = optimal_system
+                        
+                        # Generate CSV files
+                        annual_df, financial_df, config_df, timestep_df = export_detailed_calculations(
+                            detailed_result, config, 
                             optimal_system['optimal_kwp'], 
-                            optimal_system['optimal_kwh'], 
-                            pvgis_baseline,
-                            user_inputs['consumption_profile_df'], 
-                            config, 
-                            export_details=True
+                            optimal_system['optimal_kwh']
                         )
-                    else:
-                        detailed_result = optimal_system
-                    
-                    # Generate CSV files
-                    annual_df, financial_df, config_df, timestep_df = export_detailed_calculations(
-                        detailed_result, config, 
-                        optimal_system['optimal_kwp'], 
-                        optimal_system['optimal_kwh']
-                    )
-                    
-                    # Create ZIP file
-                    zip_buffer = create_calculation_report_zip(
-                        annual_df, financial_df, config_df, timestep_df
-                    )
+                        
+                        # Create ZIP file
+                        zip_buffer = create_calculation_report_zip(
+                            annual_df, financial_df, config_df, timestep_df
+                        )
+                        
+                        # Save to session state
+                        st.session_state['calculation_report_zip'] = zip_buffer.getvalue()
+                        st.session_state['last_export_details'] = export_details
+                        st.session_state['annual_df'] = annual_df
+                        st.session_state['financial_df'] = financial_df
+                        st.session_state['config_df'] = config_df
                 
-                # Download button (outside spinner to avoid issues)
-                col1, col2 = st.columns([2, 3])
-                with col1:
-                    st.download_button(
-                        label="📥 Download Detailed Calculations (ZIP)",
-                        data=zip_buffer.getvalue(),
-                        file_name=f"pv_bess_calculations_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                        mime="application/zip",
-                        help="Contains annual summary, financial calculations, configuration parameters, and optionally daily data",
-                        key="download_detailed_calcs"
-                    )
-                with col2:
-                    st.info("Click to download all calculation details in CSV format")
-                
-                # Show preview of the data
-                with st.expander("📋 Preview calculation data"):
-                    tab1, tab2, tab3 = st.tabs(["Annual Summary", "Financial Details", "Configuration"])
+                # Download button (always show if report is available)
+                if 'calculation_report_zip' in st.session_state:
+                    col1, col2 = st.columns([2, 3])
+                    with col1:
+                        st.download_button(
+                            label="📥 Download Detailed Calculations (ZIP)",
+                            data=st.session_state['calculation_report_zip'],
+                            file_name=f"pv_bess_calculations_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                            mime="application/zip",
+                            help="Contains annual summary, financial calculations, configuration parameters, and optionally daily data",
+                            key="download_detailed_calcs"
+                        )
+                    with col2:
+                        st.info("Click to download all calculation details in CSV format")
                     
-                    with tab1:
-                        st.write("**Annual Energy Flows and Financial Summary:**")
-                        st.dataframe(annual_df, use_container_width=True)
-                    
-                    with tab2:
-                        st.write("**Detailed Financial Calculations:**")
-                        st.dataframe(financial_df.head(20), use_container_width=True)
-                        st.caption("Showing first 20 rows. Full data in downloaded file.")
-                    
-                    with tab3:
-                        st.write("**Configuration Parameters Used:**")
-                        st.dataframe(config_df, use_container_width=True)
+                    # Show preview of the data
+                    if 'annual_df' in st.session_state:
+                        with st.expander("📋 Preview calculation data"):
+                            tab1, tab2, tab3 = st.tabs(["Annual Summary", "Financial Details", "Configuration"])
+                            
+                            with tab1:
+                                st.write("**Annual Energy Flows and Financial Summary:**")
+                                st.dataframe(st.session_state['annual_df'], use_container_width=True)
+                            
+                            with tab2:
+                                st.write("**Detailed Financial Calculations:**")
+                                st.dataframe(st.session_state['financial_df'].head(20), use_container_width=True)
+                                st.caption("Showing first 20 rows. Full data in downloaded file.")
+                            
+                            with tab3:
+                                st.write("**Configuration Parameters Used:**")
+                                st.dataframe(st.session_state['config_df'], use_container_width=True)
                 
                 # Recommendations
                 st.subheader("💡 Recommendations")
