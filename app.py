@@ -1200,10 +1200,10 @@ annual_consumption = sum(consumption for all intervals)
                             st.write("3. **Cash Flow calculation (your Excel formula):**")
                             st.code("""
 CF[0] = -CAPEX
-CF[n] = -O&M + (grid_export × sell_price) - (grid_import × buy_price) + (consumption × buy_price)
+CF[n] = -O&M + (grid_export * sell_price) - (grid_import * buy_price) + (consumption * buy_price)
 
 Which equals:
-CF[n] = (consumption × buy_price) - (grid_import × buy_price) + (grid_export × sell_price) - O&M
+CF[n] = (consumption * buy_price) - (grid_import * buy_price) + (grid_export * sell_price) - O&M
 """)
                             
                             st.write("4. **NPV calculation:**")
@@ -1212,22 +1212,22 @@ CF[n] = (consumption × buy_price) - (grid_import × buy_price) + (grid_export �
                             st.write("5. **Cost formulas used:**")
                             st.code("""
 # CAPEX
-CAPEX_PV = pv_kwp × (600 + 600 × exp(-pv_kwp / 290))  # Non-linear pricing
+CAPEX_PV = pv_kwp * (600 + 600 * exp(-pv_kwp / 290))  # Non-linear pricing
 CAPEX_BESS = bess_kwh × 150  # Linear pricing
 
 # O&M
-O&M_PV = (12 - 0.01 × pv_kwp) × pv_kwp  # Economies of scale
-O&M_BESS = 1500 + (CAPEX_BESS × 0.015)  # Fixed + percentage
+O&M_PV = (12 - 0.01 * pv_kwp) * pv_kwp  # Economies of scale
+O&M_BESS = 1500 + (CAPEX_BESS * 0.015)  # Fixed + percentage
 """)
                             
                             st.write("6. **Degradation models:**")
                             st.code("""
 # PV degradation (annual)
-pv_output_year_n = pv_output_year_1 × (1 - pv_degradation_rate)^(n-1)
+pv_output_year_n = pv_output_year_1 * (1 - pv_degradation_rate)^(n-1)
 
 # Battery degradation (per step)
 calendar_degradation_per_step = annual_calendar_deg / 35040
-cycle_degradation_per_step = (kwh_scaricati / battery_capacity) × (0.2 × 1.15 / total_cycles)
+cycle_degradation_per_step = (kwh_scaricati / battery_capacity) * (0.2 * 1.15 / total_cycles)
 SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
 
 # Note: Cycle degradation uses discharge from PREVIOUS step (t-1)
