@@ -1335,7 +1335,7 @@ SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
                         st.metric(
                             "Year 1 Net Benefit",
                             f"€{year_1_net_benefit:,.0f}",
-                            f"{year_5_net_benefit - year_1_net_benefit:+,_} vs Year 5"
+                            f"{year_5_net_benefit - year_1_net_benefit:+,.0f} vs Year 5"
                         )
 
                     # Visualizzazione dei flussi di cassa
