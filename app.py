@@ -659,7 +659,6 @@ def test_specific_configurations(user_inputs, config, pvgis_baseline):
             })
     
     # Display results table
-    import pandas as pd
     df_results = pd.DataFrame(results)
     st.dataframe(df_results, use_container_width=True)
     
@@ -1391,60 +1390,63 @@ SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
                                            value='export_daily_data' in locals() and export_daily_data,
                                            help="This will increase file size but provide more granular data")
                 
-                if st.button("📥 Generate Detailed Calculation Report", type="secondary"):
-                    with st.spinner("Generating detailed report..."):
-                        # Re-run simulation with export details if needed
-                        if export_details:
-                            detailed_result = run_simulation_vectorized(
-                                optimal_system['optimal_kwp'], 
-                                optimal_system['optimal_kwh'], 
-                                pvgis_baseline,
-                                user_inputs['consumption_profile_df'], 
-                                config, 
-                                export_details=True
-                            )
-                        else:
-                            detailed_result = optimal_system
-                        
-                        # Generate CSV files
-                        annual_df, financial_df, config_df, timestep_df = export_detailed_calculations(
-                            detailed_result, config, 
+                # Generate report directly without button to avoid state loss
+                with st.spinner("Generating detailed report..."):
+                    # Re-run simulation with export details if needed
+                    if export_details:
+                        detailed_result = run_simulation_vectorized(
                             optimal_system['optimal_kwp'], 
-                            optimal_system['optimal_kwh']
+                            optimal_system['optimal_kwh'], 
+                            pvgis_baseline,
+                            user_inputs['consumption_profile_df'], 
+                            config, 
+                            export_details=True
                         )
-                        
-                        # Create ZIP file
-                        zip_buffer = create_calculation_report_zip(
-                            annual_df, financial_df, config_df, timestep_df
-                        )
-                        
-                        # Download button
-                        st.download_button(
-                            label="📥 Download Calculation Report (ZIP)",
-                            data=zip_buffer,
-                            file_name=f"pv_bess_calculations_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                            mime="application/zip",
-                            help="Contains annual summary, financial calculations, configuration parameters, and optionally daily data"
-                        )
-                        
-                        st.success("✅ Detailed calculation report generated!")
-                        
-                        # Show preview of the data
-                        with st.expander("Preview calculation data"):
-                            tab1, tab2, tab3 = st.tabs(["Annual Summary", "Financial Details", "Configuration"])
-                            
-                            with tab1:
-                                st.write("**Annual Energy Flows and Financial Summary:**")
-                                st.dataframe(annual_df, use_container_width=True)
-                            
-                            with tab2:
-                                st.write("**Detailed Financial Calculations:**")
-                                st.dataframe(financial_df.head(20), use_container_width=True)
-                                st.caption("Showing first 20 rows. Full data in downloaded file.")
-                            
-                            with tab3:
-                                st.write("**Configuration Parameters Used:**")
-                                st.dataframe(config_df, use_container_width=True)
+                    else:
+                        detailed_result = optimal_system
+                    
+                    # Generate CSV files
+                    annual_df, financial_df, config_df, timestep_df = export_detailed_calculations(
+                        detailed_result, config, 
+                        optimal_system['optimal_kwp'], 
+                        optimal_system['optimal_kwh']
+                    )
+                    
+                    # Create ZIP file
+                    zip_buffer = create_calculation_report_zip(
+                        annual_df, financial_df, config_df, timestep_df
+                    )
+                
+                # Download button (outside spinner to avoid issues)
+                col1, col2 = st.columns([2, 3])
+                with col1:
+                    st.download_button(
+                        label="📥 Download Detailed Calculations (ZIP)",
+                        data=zip_buffer.getvalue(),
+                        file_name=f"pv_bess_calculations_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                        mime="application/zip",
+                        help="Contains annual summary, financial calculations, configuration parameters, and optionally daily data",
+                        key="download_detailed_calcs"
+                    )
+                with col2:
+                    st.info("Click to download all calculation details in CSV format")
+                
+                # Show preview of the data
+                with st.expander("📋 Preview calculation data"):
+                    tab1, tab2, tab3 = st.tabs(["Annual Summary", "Financial Details", "Configuration"])
+                    
+                    with tab1:
+                        st.write("**Annual Energy Flows and Financial Summary:**")
+                        st.dataframe(annual_df, use_container_width=True)
+                    
+                    with tab2:
+                        st.write("**Detailed Financial Calculations:**")
+                        st.dataframe(financial_df.head(20), use_container_width=True)
+                        st.caption("Showing first 20 rows. Full data in downloaded file.")
+                    
+                    with tab3:
+                        st.write("**Configuration Parameters Used:**")
+                        st.dataframe(config_df, use_container_width=True)
                 
                 # Recommendations
                 st.subheader("💡 Recommendations")
@@ -1518,7 +1520,8 @@ SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
                     label="📥 Download Results Summary",
                     data=results_text,
                     file_name=f"pv_bess_optimization_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                    mime="text/plain"
+                    mime="text/plain",
+                    key="download_summary"
                 )
             
     else:
