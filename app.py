@@ -1067,7 +1067,7 @@ def build_ui():
                         pvgis_baseline = get_pvgis_data(lat, lon)
     
                         if pvgis_baseline is not None and not pvgis_baseline.empty:
-                        st.success("✅ Solar data retrieved successfully!")
+                            st.success("✅ Solar data retrieved successfully!")
              
 
                         
