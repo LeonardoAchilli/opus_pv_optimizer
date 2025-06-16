@@ -1051,18 +1051,17 @@ def build_ui():
             with st.spinner('🔄 Fetching solar data and running optimization...'):
                 # Get PVGIS data
                 pvgis_baseline = get_pvgis_data(lat, lon)
+                if pvgis_baseline is not None and not pvgis_baseline.empty:
+                    st.success("✅ Solar data retrieved successfully!")
                     
-                    if pvgis_baseline is not None and not pvgis_baseline.empty:
-                        st.success("✅ Solar data retrieved successfully!")
-                        
-                        # Run specific configuration tests if requested
-                        if test_configs:
-                            test_results = test_specific_configurations(user_inputs, config, pvgis_baseline)
-                            st.info("💡 Use these results to verify the optimization algorithm is working correctly")
-                            st.markdown("---")
-                        
-                        # Continue with optimization if requested
-                        if run_optimization:
+                    # Run specific configuration tests if requested
+                    if test_configs:
+                        test_results = test_specific_configurations(user_inputs, config, pvgis_baseline)
+                        st.info("💡 Use these results to verify the optimization algorithm is working correctly")
+                        st.markdown("---")
+                    
+                    # Continue with optimization if requested
+                    if run_optimization:
                         # Debug info
                         with st.expander("🔍 Debug Information & Calculation Logic"):
                             st.write(f"PVGIS data points: {len(pvgis_baseline)}")
