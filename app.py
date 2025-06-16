@@ -1254,7 +1254,7 @@ SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
                                 - No combination meets the constraints
                                 
                                 **Try:**
-                                - Increasing the budget (€150,000+)
+                                - Increasing the budget (150,000+)
                                 - Checking your consumption data
                                 """)
                             else:
