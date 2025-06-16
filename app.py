@@ -1,4 +1,19 @@
-import json
+# Try to export the optimal configuration data
+                                if st.checkbox("Export optimal configuration data for debugging"):
+                                    try:
+                                        # Re-run with debug and export
+                                        debug_result = run_simulation_vectorized(
+                                            optimal_system['optimal_kwp'], 
+                                            optimal_system['optimal_kwh'], 
+                                            pvgis_baseline,
+                                            user_inputs['consumption_profile_df'], 
+                                            config, 
+                                            export_details=True,
+                                            debug=True
+                                        )
+                                        st.success("Debug data generated - check the output above")
+                                    except Exception as e:
+                                        st.error(f"Debug export failed: {str(e)}")import json
 import numpy as np
 import pandas as pd
 import requests
@@ -60,6 +75,12 @@ def get_pvgis_data(latitude: float, longitude: float) -> pd.DataFrame:
             # Convert power from W to kW
             if 'P' in df.columns:
                 df['P_kW'] = df['P'] / 1000.0
+                
+                # Debug print
+                print(f"PVGIS data retrieved: {len(df)} hours")
+                print(f"Sample values: {df['P_kW'].head()}")
+                print(f"Max power: {df['P_kW'].max():.3f} kW")
+                print(f"Annual production (1 kWp): {df['P_kW'].sum():.0f} kWh")
             else:
                 return None
             
@@ -76,6 +97,13 @@ def get_pvgis_data(latitude: float, longitude: float) -> pd.DataFrame:
                                              periods=padding, freq='15min')
                     pad_df = pd.DataFrame({'P_kW': [0] * padding}, index=pad_index)
                     df_resampled = pd.concat([df_resampled, pad_df])
+                
+                # Verify data
+                non_zero = (df_resampled['P_kW'] > 0).sum()
+                if non_zero == 0:
+                    st.error(f"⚠️ WARNING: All PVGIS values are zero! Location: {latitude}, {longitude}")
+                    return None
+                    
                 return df_resampled
             
             return df[['P_kW']]
@@ -165,7 +193,7 @@ def get_pvgis_data(latitude: float, longitude: float) -> pd.DataFrame:
         return None
 
 
-def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, consumption_profile, config, export_details=False):
+def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, consumption_profile, config, export_details=False, debug=False):
     """Vectorized simulation with exact energy flow formulas as specified."""
     # Extract configuration parameters
     dod = config['bess_dod']
@@ -182,6 +210,31 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
     # Convert data to numpy arrays
     pv_base = pvgis_baseline_data['P_kW'].to_numpy(dtype=np.float32)
     cons = consumption_profile['consumption_kWh'].to_numpy(dtype=np.float32)
+    
+    # Debug information
+    if debug:
+        st.write("### 🔍 Debug Information - Simulation Input")
+        st.write(f"**PV System:** {pv_kwp} kWp")
+        st.write(f"**Battery:** {bess_kwh_nominal} kWh (usable: {kwh_netti:.1f} kWh)")
+        st.write(f"**PVGIS data points:** {len(pv_base)}")
+        st.write(f"**PVGIS baseline stats:**")
+        st.write(f"  - Mean: {pv_base.mean():.3f} kW")
+        st.write(f"  - Max: {pv_base.max():.3f} kW")
+        st.write(f"  - Min: {pv_base.min():.3f} kW")
+        st.write(f"  - Sum: {pv_base.sum():.1f} kW")
+        st.write(f"  - Non-zero values: {(pv_base > 0).sum()} of {len(pv_base)}")
+        
+        # Show sample of PVGIS data
+        st.write("**Sample PVGIS data (first 96 intervals = 1 day):**")
+        sample_df = pd.DataFrame({
+            'Hour': [i/4 for i in range(96)],
+            'PVGIS_kW': pv_base[:96],
+            'PV_Production_kWh': pv_base[:96] * pv_kwp * 0.25
+        })
+        st.line_chart(sample_df.set_index('Hour')['PV_Production_kWh'])
+        
+        st.write(f"**Consumption data points:** {len(cons)}")
+        st.write(f"**Annual consumption:** {cons.sum():.0f} kWh")
     
     # Debug: Check consumption data
     annual_consumption = cons.sum()
@@ -208,10 +261,29 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
     if export_details:
         timestep_data = []
     
+    # Debug arrays for first year
+    if debug:
+        debug_data = {
+            'timestep': [],
+            'pv_production': [],
+            'consumption': [],
+            'grid_import': [],
+            'grid_export': [],
+            'battery_charge': [],
+            'battery_discharge': [],
+            'soc': []
+        }
+    
     # Run 5-year simulation
     for year in range(5):
         # Apply PV degradation
         pv_production = pv_base * pv_kwp * pv_degradation_factors[year] * 0.25  # kWh per 15-min
+        
+        if debug and year == 0:
+            st.write(f"**Year 1 PV production calculation:**")
+            st.write(f"  - PV base (1 kWp) annual: {pv_base.sum() * 0.25:.0f} kWh")
+            st.write(f"  - PV scaled ({pv_kwp} kWp) annual: {pv_production.sum():.0f} kWh")
+            st.write(f"  - Degradation factor: {pv_degradation_factors[year]:.3f}")
         
         # Initialize arrays for this year
         soc = np.zeros(steps_per_year + 1, dtype=np.float32)
@@ -253,8 +325,9 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
                 immissione[t] = 0
             
             # 3. Calculate grid import (Acquisto)
-            # Energy deficit not covered by production and battery
-            acquisto[t] = max(0, consumo - produzione - soc[t])
+            # Energy deficit not covered by production and battery discharge
+            energy_from_battery = kwh_scaricati[t] * efficiency
+            acquisto[t] = max(0, consumo - produzione - energy_from_battery)
             
             # 4. Now update SoC and track energy charged
             if produzione >= consumo:
@@ -270,6 +343,14 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
                 soc[t+1] = soc[t] - kwh_scaricati[t]
                 kwh_caricati[t] = 0
             
+            # Debug: energy balance check for first timesteps
+            if debug and year == 0 and t < 10:
+                energy_in = produzione + acquisto[t] + (kwh_scaricati[t] * efficiency)
+                energy_out = consumo + immissione[t] + kwh_caricati[t]
+                balance_error = abs(energy_in - energy_out)
+                if balance_error > 0.001:
+                    st.warning(f"Energy balance error at t={t}: IN={energy_in:.3f} OUT={energy_out:.3f} Error={balance_error:.3f}")
+            
             # 5. Calculate SoH degradation
             if t > 0:  # Use previous step's discharge for degradation
                 cycle_degradation = (kwh_scaricati[t-1] / bess_kwh_nominal) * (0.2 * 1.15 / tot_cycles)
@@ -279,6 +360,17 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
             calendar_deg_per_step = calendar_degradation / steps_per_year
             soh[t+1] = soh[t] - calendar_deg_per_step - cycle_degradation
             soh[t+1] = max(0, soh[t+1])  # Ensure SoH doesn't go negative
+            
+            # Store debug data for first day of first year
+            if debug and year == 0 and t < 96:
+                debug_data['timestep'].append(t)
+                debug_data['pv_production'].append(produzione)
+                debug_data['consumption'].append(consumo)
+                debug_data['grid_import'].append(acquisto[t])
+                debug_data['grid_export'].append(immissione[t])
+                debug_data['battery_charge'].append(kwh_caricati[t])
+                debug_data['battery_discharge'].append(kwh_scaricati[t] * efficiency)
+                debug_data['soc'].append(soc[t])
             
             # Store timestep data if requested
             if export_details and t % 96 == 0:  # Store daily data to reduce size
@@ -304,6 +396,21 @@ def run_simulation_vectorized(pv_kwp, bess_kwh_nominal, pvgis_baseline_data, con
         yearly_battery_charge = kwh_caricati.sum()  # Energy sent to battery
         
         yearly_self_consumption = yearly_consumption - yearly_energy_bought
+        
+        if debug and year == 0:
+            st.write(f"**Year 1 Annual Totals:**")
+            st.write(f"  - PV Production: {yearly_pv_production:.0f} kWh")
+            st.write(f"  - Consumption: {yearly_consumption:.0f} kWh")
+            st.write(f"  - Grid Import: {yearly_energy_bought:.0f} kWh")
+            st.write(f"  - Grid Export: {yearly_energy_sold:.0f} kWh")
+            st.write(f"  - Battery Charge: {yearly_battery_charge:.0f} kWh")
+            st.write(f"  - Battery Discharge: {yearly_battery_discharge:.0f} kWh")
+            st.write(f"  - Self-consumption: {yearly_self_consumption:.0f} kWh")
+            
+            # Show debug table for first day
+            st.write("**First Day Energy Flows (15-min intervals):**")
+            debug_df = pd.DataFrame(debug_data)
+            st.dataframe(debug_df.head(24), use_container_width=True)  # Show first 6 hours
         
         # Store detailed metrics
         annual_metrics.append({
@@ -615,7 +722,7 @@ Generated on: {}
     return zip_buffer
 
 
-def test_specific_configurations(user_inputs, config, pvgis_baseline):
+def test_specific_configurations(user_inputs, config, pvgis_baseline, enable_debug=False):
     """Test specific PV and BESS configurations as requested."""
     test_configs = [
         (150, 100, "Large system"),
@@ -629,6 +736,14 @@ def test_specific_configurations(user_inputs, config, pvgis_baseline):
     
     results = []
     st.write("### 🧪 Testing Specific Configurations")
+    
+    # Add special debug test for small system
+    if enable_debug:
+        st.info("🔍 Debug mode enabled - Running detailed test on 5 kWp PV only system")
+        debug_result = run_simulation_vectorized(5, 0, pvgis_baseline, 
+                                               user_inputs['consumption_profile_df'], 
+                                               config, debug=True)
+        st.write("---")
     
     for pv_kwp, bess_kwh, desc in test_configs:
         # Check if within constraints
@@ -676,7 +791,7 @@ def test_specific_configurations(user_inputs, config, pvgis_baseline):
     return results
 
 
-def find_optimal_system(user_inputs, config, pvgis_baseline):
+def find_optimal_system(user_inputs, config, pvgis_baseline, enable_debug=False):
     """Finds the optimal PV and BESS combination with improved search algorithm."""
     # Calculate maximum feasible sizes
     max_kwp_from_area = user_inputs['available_area_m2'] / 5.0  # 5 m²/kWp
@@ -731,9 +846,11 @@ def find_optimal_system(user_inputs, config, pvgis_baseline):
             
             valid_solutions += 1
             
-            # Run vectorized simulation
+            # Run vectorized simulation - add debug for first valid config
+            debug_this = enable_debug and valid_solutions == 1
             result = run_simulation_vectorized(pv_kwp, bess_kwh, pvgis_baseline, 
-                                             user_inputs['consumption_profile_df'], config)
+                                             user_inputs['consumption_profile_df'], config,
+                                             debug=debug_this)
             
             # Store result for analysis
             result['pv_kwp'] = pv_kwp
@@ -901,13 +1018,34 @@ def build_ui():
                                 help="Decimal degrees East")
         
         # Test location button
-        if st.button("🧪 Test Location", help="Check if solar data is available for this location"):
-            with st.spinner("Testing location..."):
-                test_data = get_pvgis_data(lat, lon)
-                if test_data is not None and not test_data.empty:
-                    st.success(f"✅ Location valid! Solar data available for {lat:.2f}°N, {lon:.2f}°E")
-                else:
-                    st.error("❌ No solar data available for this location")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🧪 Test Location", help="Check if solar data is available for this location"):
+                with st.spinner("Testing location..."):
+                    test_data = get_pvgis_data(lat, lon)
+                    if test_data is not None and not test_data.empty:
+                        st.success(f"✅ Location valid! Solar data available for {lat:.2f}°N, {lon:.2f}°E")
+                        
+                        # Show quick stats
+                        annual_production_1kwp = test_data['P_kW'].sum() * 0.25
+                        st.info(f"Expected annual production for 1 kWp: {annual_production_1kwp:.0f} kWh/year")
+                        
+                        # Show daily profile
+                        with st.expander("View typical daily solar profile"):
+                            daily_profile = test_data['P_kW'][:96].to_numpy()
+                            hours = [i/4 for i in range(96)]
+                            profile_df = pd.DataFrame({
+                                'Hour': hours,
+                                'Power (kW)': daily_profile
+                            })
+                            st.line_chart(profile_df.set_index('Hour'))
+                    else:
+                        st.error("❌ No solar data available for this location")
+        
+        with col2:
+            if st.button("🔄 Clear Cache", help="Clear cached data and force reload"):
+                st.cache_data.clear()
+                st.success("Cache cleared! Data will be reloaded on next run.")
         
         st.subheader("3. Consumption Profile")
         uploaded_file = st.file_uploader(
@@ -946,6 +1084,10 @@ def build_ui():
             efficiency = st.slider("Charge/Discharge Efficiency (%)", 85, 98, 95) / 100
             pv_degr = st.slider("PV Annual Degradation (%)", 0.2, 2.0, 1.0) / 100
             bess_cal_degr = st.slider("Battery Calendar Degradation (%/year)", 0.5, 3.0, 1.5) / 100
+            
+            st.write("**Debug Options**")
+            enable_debug = st.checkbox("Enable debug mode", value=False, 
+                                     help="Show detailed calculation steps and intermediate results")
             
             st.write("**Export Options**")
             export_daily_data = st.checkbox("Export daily timestep data", value=False, 
@@ -1056,7 +1198,8 @@ def build_ui():
                     
                     # Run specific configuration tests if requested
                     if test_configs:
-                        test_results = test_specific_configurations(user_inputs, config, pvgis_baseline)
+                        test_results = test_specific_configurations(user_inputs, config, pvgis_baseline, 
+                                                                   enable_debug='enable_debug' in locals() and enable_debug)
                         st.info("💡 Use these results to verify the optimization algorithm is working correctly")
                         st.markdown("---")
                     
@@ -1064,12 +1207,32 @@ def build_ui():
                     if run_optimization:
                         # Debug info
                         with st.expander("🔍 Debug Information & Calculation Logic"):
+                            st.write("**Input Data Validation:**")
                             st.write(f"PVGIS data points: {len(pvgis_baseline)}")
+                            st.write(f"PVGIS data sample (first 10 values): {pvgis_baseline['P_kW'].head(10).tolist()}")
+                            st.write(f"PVGIS annual total (1 kWp): {pvgis_baseline['P_kW'].sum() * 0.25:.0f} kWh")
                             st.write(f"Consumption data points: {len(consumption_df)}")
+                            st.write(f"Annual consumption: {consumption_df['consumption_kWh'].sum():.0f} kWh")
                             st.write(f"Budget: €{budget:,.0f}")
                             st.write(f"Available area: {available_area_m2} m²")
                             st.write(f"Max PV from area: {available_area_m2 / 5.0:.1f} kWp")
                             st.write(f"Max PV from budget: {budget / 650:.1f} kWp")
+                            
+                            # Add quick sanity check
+                            if st.button("🧪 Run Quick Sanity Check (5 kWp PV only)"):
+                                st.write("**Testing 5 kWp PV system with no battery:**")
+                                test_result = run_simulation_vectorized(
+                                    5, 0, pvgis_baseline, 
+                                    consumption_df, config, 
+                                    debug=True
+                                )
+                                st.write(f"NPV: €{test_result['npv_eur']:,.0f}")
+                                st.write(f"Annual metrics Year 1:")
+                                if test_result['annual_metrics']:
+                                    metrics = test_result['annual_metrics'][0]
+                                    st.write(f"- PV Production: {metrics['pv_production']:,.0f} kWh")
+                                    st.write(f"- Grid Import: {metrics['energy_bought']:,.0f} kWh")
+                                    st.write(f"- Grid Export: {metrics['energy_sold']:,.0f} kWh")
                             
                             st.markdown("---")
                             st.write("**Simulation Logic (Step-by-Step):**")
@@ -1159,7 +1322,8 @@ SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
                         
                         # Run optimization with error handling
                         try:
-                            optimal_system = find_optimal_system(user_inputs, config, pvgis_baseline)
+                            optimal_system = find_optimal_system(user_inputs, config, pvgis_baseline,
+                                                               enable_debug='enable_debug' in locals() and enable_debug)
                             
                             if optimal_system is None:
                                 st.error("❌ No valid solution found!")
@@ -1415,6 +1579,14 @@ SoH_new = SoH_old - calendar_degradation_per_step - cycle_degradation_per_step
                             optimal_system['optimal_kwp'], 
                             optimal_system['optimal_kwh']
                         )
+                        
+                        # Add diagnostic data
+                        if annual_df['PV_Production_kWh'].sum() == 0:
+                            st.error("⚠️ WARNING: PV Production is ZERO in results! This indicates a calculation error.")
+                            st.write("Please check:")
+                            st.write("1. PVGIS data was loaded correctly (use Test Location button)")
+                            st.write("2. Enable debug mode in Advanced Settings")
+                            st.write("3. Run 'Test Specific Configs' to see detailed output")
                         
                         st.success("✅ Calculation reports generated successfully!")
                         
