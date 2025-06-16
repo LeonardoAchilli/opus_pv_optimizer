@@ -1,19 +1,4 @@
-# Try to export the optimal configuration data
-                                if st.checkbox("Export optimal configuration data for debugging"):
-                                    try:
-                                        # Re-run with debug and export
-                                        debug_result = run_simulation_vectorized(
-                                            optimal_system['optimal_kwp'], 
-                                            optimal_system['optimal_kwh'], 
-                                            pvgis_baseline,
-                                            user_inputs['consumption_profile_df'], 
-                                            config, 
-                                            export_details=True,
-                                            debug=True
-                                        )
-                                        st.success("Debug data generated - check the output above")
-                                    except Exception as e:
-                                        st.error(f"Debug export failed: {str(e)}")import json
+
 import numpy as np
 import pandas as pd
 import requests
