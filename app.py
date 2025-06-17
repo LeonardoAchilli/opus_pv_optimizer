@@ -13,7 +13,7 @@ from typing import Dict, Tuple, Optional, List
 def validate_pv_data(pv_df: pd.DataFrame) -> Tuple[bool, str, Optional[pd.DataFrame]]:
     """
     Validate PV production data from uploaded CSV.
-    Handles both comma and dot as decimal separator.
+    Expects kWh values per 15-minute interval for 1 kWp system.
     
     Returns:
         Tuple of (is_valid, error_message, processed_dataframe)
@@ -29,75 +29,45 @@ def validate_pv_data(pv_df: pd.DataFrame) -> Tuple[bool, str, Optional[pd.DataFr
     # Use the first column as PV production data
     pv_column = pv_df.columns[0]
     
-    # Check if we need to convert values
-    # If the column is already numeric, no conversion needed
-    if pd.api.types.is_numeric_dtype(pv_df[pv_column]):
+    # Create a clean dataframe with standardized column name
+    try:
         clean_df = pd.DataFrame({
-            'pv_production_kwp': pv_df[pv_column]
+            'pv_production_kwp': pd.to_numeric(pv_df[pv_column], errors='coerce')
         })
-    else:
-        # Column contains strings, need to convert
-        # Replace comma with dot for decimal separator
-        pv_df[pv_column] = pv_df[pv_column].astype(str).str.replace(',', '.', regex=False)
-        
-        # Create a clean dataframe with standardized column name
-        try:
-            clean_df = pd.DataFrame({
-                'pv_production_kwp': pd.to_numeric(pv_df[pv_column], errors='coerce')
-            })
-        except Exception as e:
-            return False, f"Error converting values to numbers: {str(e)}", None
-        
-        # Check for conversion errors
-        if clean_df['pv_production_kwp'].isna().sum() > 0:
-            n_errors = clean_df['pv_production_kwp'].isna().sum()
-            return False, f"Found {n_errors} values that couldn't be converted to numbers", None
+    except Exception as e:
+        return False, f"Error converting values to numbers: {str(e)}", None
+    
+    # Check for conversion errors
+    if clean_df['pv_production_kwp'].isna().sum() > 0:
+        n_errors = clean_df['pv_production_kwp'].isna().sum()
+        return False, f"Found {n_errors} values that couldn't be converted to numbers", None
     
     # Check number of rows
     expected_rows = 35040
     actual_rows = len(clean_df)
     
     if actual_rows != expected_rows:
-        # Try to handle common cases
-        if actual_rows == 8760:  # Hourly data
-            # Resample to 15-minute intervals
-            clean_df = clean_df.iloc[np.repeat(np.arange(len(clean_df)), 4)].reset_index(drop=True)
-            clean_df = clean_df.iloc[:expected_rows]  # Ensure exact length
-            return True, f"Converted hourly data to 15-min intervals", clean_df
-        else:
-            return False, f"Expected {expected_rows:,} rows (15-min intervals for 1 year), found {actual_rows:,}", None
+        return False, f"Expected {expected_rows:,} rows (15-min intervals for 1 year), found {actual_rows:,}", None
     
     # Validate data range
     if clean_df['pv_production_kwp'].min() < 0:
         return False, "Negative values found in PV production data", None
     
-    # Determine if values are in kW or kWh based on typical ranges
-    max_value = clean_df['pv_production_kwp'].max()
-    sum_value = clean_df['pv_production_kwp'].sum()
-    
-    # If max value is < 0.5, likely kWh per interval; if > 0.5, likely kW
-    if max_value < 0.5:
-        # Values appear to be in kWh per 15-min interval
-        annual_production = sum_value  # Already in kWh
-        st.info(f"📊 Detected format: kWh per 15-min interval (max value: {max_value:.3f})")
-    else:
-        # Values appear to be in kW
-        annual_production = sum_value * 0.25  # Convert to kWh
-        st.info(f"📊 Detected format: kW instantaneous power (max value: {max_value:.3f})")
+    # Calculate annual production
+    annual_production = clean_df['pv_production_kwp'].sum()
     
     # Check if all values are zero
-    if sum_value == 0:
+    if annual_production == 0:
         return False, "All PV production values are zero", None
     
-    # Check if annual production is reasonable
-    if annual_production < 500:  # Less than 500 kWh/kWp/year is too low
-        return False, f"Annual production too low: {annual_production:.0f} kWh/kWp. Expected 800-1500 kWh/kWp for Europe", None
+    # Check if annual production is reasonable (expecting around 1373 kWh for 1 kWp)
+    if annual_production < 800:  # Less than 800 kWh/kWp/year is too low
+        return False, f"Annual production too low: {annual_production:.0f} kWh/kWp. Expected 800-1800 kWh/kWp", None
     
     if annual_production > 2000:  # More than 2000 kWh/kWp/year is too high
-        return False, f"Annual production too high: {annual_production:.0f} kWh/kWp. Expected 800-1500 kWh/kWp for Europe", None
+        return False, f"Annual production too high: {annual_production:.0f} kWh/kWp. Expected 800-1800 kWh/kWp", None
     
-    # Store the detected format in the dataframe attributes for later use
-    clean_df.attrs['is_kwh_format'] = (max_value < 0.5)
+    # Store metadata
     clean_df.attrs['annual_production'] = annual_production
     
     return True, f"Valid PV data - Annual production: {annual_production:.0f} kWh/kWp", clean_df
