@@ -71,22 +71,36 @@ def validate_pv_data(pv_df: pd.DataFrame) -> Tuple[bool, str, Optional[pd.DataFr
     if clean_df['pv_production_kwp'].min() < 0:
         return False, "Negative values found in PV production data", None
     
-    if clean_df['pv_production_kwp'].max() > 1.5:
-        return False, "PV production values seem too high for 1 kWp system (max > 1.5 kW)", None
+    # Determine if values are in kW or kWh based on typical ranges
+    max_value = clean_df['pv_production_kwp'].max()
+    sum_value = clean_df['pv_production_kwp'].sum()
+    
+    # If max value is < 0.5, likely kWh per interval; if > 0.5, likely kW
+    if max_value < 0.5:
+        # Values appear to be in kWh per 15-min interval
+        annual_production = sum_value  # Already in kWh
+        st.info(f"📊 Detected format: kWh per 15-min interval (max value: {max_value:.3f})")
+    else:
+        # Values appear to be in kW
+        annual_production = sum_value * 0.25  # Convert to kWh
+        st.info(f"📊 Detected format: kW instantaneous power (max value: {max_value:.3f})")
     
     # Check if all values are zero
-    if clean_df['pv_production_kwp'].sum() == 0:
+    if sum_value == 0:
         return False, "All PV production values are zero", None
     
     # Check if annual production is reasonable
-    annual_production = clean_df['pv_production_kwp'].sum() * 0.25  # kWh per year
     if annual_production < 500:  # Less than 500 kWh/kWp/year is too low
         return False, f"Annual production too low: {annual_production:.0f} kWh/kWp. Expected 800-1500 kWh/kWp for Europe", None
     
     if annual_production > 2000:  # More than 2000 kWh/kWp/year is too high
         return False, f"Annual production too high: {annual_production:.0f} kWh/kWp. Expected 800-1500 kWh/kWp for Europe", None
     
-    return True, "Valid PV production data", clean_df
+    # Store the detected format in the dataframe attributes for later use
+    clean_df.attrs['is_kwh_format'] = (max_value < 0.5)
+    clean_df.attrs['annual_production'] = annual_production
+    
+    return True, f"Valid PV data - Annual production: {annual_production:.0f} kWh/kWp", clean_df
 
 
 def run_simulation_vectorized(pv_kwp: float, bess_kwh_nominal: float, pv_production_baseline: pd.DataFrame, 
@@ -94,8 +108,7 @@ def run_simulation_vectorized(pv_kwp: float, bess_kwh_nominal: float, pv_product
                             export_details: bool = False, debug: bool = False) -> Dict:
     """
     Optimized vectorized simulation with exact energy flow formulas.
-    
-    Key optimization: Removed redundant calculations and improved memory usage.
+    Handles both kW and kWh input formats for PV data.
     """
     # Extract configuration parameters
     dod = config['bess_dod']
@@ -113,15 +126,25 @@ def run_simulation_vectorized(pv_kwp: float, bess_kwh_nominal: float, pv_product
     pv_base = pv_production_baseline['pv_production_kwp'].to_numpy(dtype=np.float32)
     cons = consumption_profile['consumption_kWh'].to_numpy(dtype=np.float32)
     
+    # Check if PV data is already in kWh format
+    is_kwh_format = pv_production_baseline.attrs.get('is_kwh_format', False)
+    
     # Debug information
     if debug:
         st.write("### 🔍 Debug Information - Simulation Input")
         st.write(f"**PV System:** {pv_kwp} kWp")
         st.write(f"**Battery:** {bess_kwh_nominal} kWh (usable: {kwh_netti:.1f} kWh)")
+        st.write(f"**PV data format:** {'kWh per interval' if is_kwh_format else 'kW instantaneous'}")
         st.write(f"**PV baseline data points:** {len(pv_base)}")
+        
+        if is_kwh_format:
+            annual_prod_1kwp = pv_base.sum()
+        else:
+            annual_prod_1kwp = pv_base.sum() * 0.25
+        
         st.write(f"**PV baseline stats (1 kWp):**")
-        st.write(f"  - Annual production: {pv_base.sum() * 0.25:.0f} kWh")
-        st.write(f"  - Peak power: {pv_base.max():.3f} kW")
+        st.write(f"  - Annual production: {annual_prod_1kwp:.0f} kWh")
+        st.write(f"  - Peak value: {pv_base.max():.3f} {'kWh/interval' if is_kwh_format else 'kW'}")
         st.write(f"  - Non-zero values: {(pv_base > 0).sum()} of {len(pv_base)}")
     
     # Calculate base case annual cost
@@ -145,7 +168,12 @@ def run_simulation_vectorized(pv_kwp: float, bess_kwh_nominal: float, pv_product
     # Run 5-year simulation
     for year in range(5):
         # Apply PV degradation and scale by system size
-        pv_production = pv_base * pv_kwp * pv_degradation_factors[year] * 0.25  # kWh per 15-min
+        if is_kwh_format:
+            # Data is already in kWh per 15-min interval
+            pv_production = pv_base * pv_kwp * pv_degradation_factors[year]
+        else:
+            # Data is in kW, convert to kWh per 15-min
+            pv_production = pv_base * pv_kwp * pv_degradation_factors[year] * 0.25
         
         if debug and year == 0:
             st.write(f"**Year 1 PV production:**")
@@ -689,8 +717,9 @@ def build_ui():
         st.markdown("""
             📁 **Upload PV production baseline (1 kWp)**
             - 35,040 rows (15-min intervals)
-            - Values in kW for 1 kWp system
-            - ✅ Supports both comma (1,234) and dot (1.234) as decimal separator
+            - Values in **kW** (instantaneous power) or **kWh** (energy per interval)
+            - ✅ Auto-detects format based on values
+            - ✅ Supports comma (1,234) or dot (1.234) decimals
         """)
         
         pv_file = st.file_uploader(
@@ -703,7 +732,7 @@ def build_ui():
         # Show sample PV data format
         with st.expander("📋 View Sample PV Data Format"):
             st.code("""
-pv_production_kw
+pv_production
 0.000
 0.000
 0.000
@@ -715,25 +744,21 @@ pv_production_kw
             """)
             
             st.info("""
-            💡 **Supported CSV Formats:**
+            💡 **PV Data Format Options:**
             
-            **Option 1 - Semicolon separator with comma decimal (European):**
-            ```
-            pv_production_kw
-            0,000
-            0,125
-            1,234
-            ```
+            **1. Power Values (kW)** - Instantaneous power
+            - Range: 0 to ~1 kW for 1 kWp system
+            - Example: 0.850 = 850 W instantaneous power
             
-            **Option 2 - Comma separator with dot decimal (International):**
-            ```
-            pv_production_kw
-            0.000
-            0.125
-            1.234
-            ```
+            **2. Energy Values (kWh)** - Energy per 15-min interval
+            - Range: 0 to ~0.25 kWh for 1 kWp system  
+            - Example: 0.212 = 212 Wh in 15 minutes
             
-            The system automatically detects your format!
+            The system **automatically detects** which format you're using based on the maximum values!
+            
+            **CSV Format Support:**
+            - European: Semicolon separator with comma decimal (0,850)
+            - International: Comma separator with dot decimal (0.850)
             """)
             
             if st.button("📊 Generate Sample PV Data"):
@@ -766,24 +791,44 @@ pv_production_kw
                 })
                 
                 # Let user choose format
-                format_choice = st.radio(
+                data_format = st.radio(
+                    "Choose data format:",
+                    ["kW (instantaneous power)", "kWh (energy per 15-min interval)"],
+                    key="pv_data_format_choice"
+                )
+                
+                csv_format = st.radio(
                     "Choose CSV format:",
                     ["International (comma separator, dot decimal)", 
                      "European (semicolon separator, comma decimal)"],
-                    key="pv_format_choice"
+                    key="pv_csv_format_choice"
                 )
                 
-                if format_choice == "European (semicolon separator, comma decimal)":
+                # Adjust values based on format choice
+                if data_format == "kWh (energy per 15-min interval)":
+                    # Convert kW to kWh (multiply by 0.25 hours)
+                    pv_sample_df['pv_production'] = pv_sample_df['pv_production_kw'] * 0.25
+                    column_name = 'pv_production_kwh'
+                else:
+                    pv_sample_df['pv_production'] = pv_sample_df['pv_production_kw']
+                    column_name = 'pv_production_kw'
+                
+                # Create final dataframe with appropriate column name
+                final_df = pd.DataFrame({
+                    column_name: pv_sample_df['pv_production']
+                })
+                
+                if csv_format == "European (semicolon separator, comma decimal)":
                     # Convert to European format
-                    csv = pv_sample_df.to_csv(index=False, sep=';', decimal=',')
-                    file_name = "sample_pv_production_1kwp_EU.csv"
+                    csv = final_df.to_csv(index=False, sep=';', decimal=',')
+                    file_name = f"sample_pv_1kwp_{data_format[:3]}_EU.csv"
                 else:
                     # Standard format
-                    csv = pv_sample_df.to_csv(index=False)
-                    file_name = "sample_pv_production_1kwp.csv"
+                    csv = final_df.to_csv(index=False)
+                    file_name = f"sample_pv_1kwp_{data_format[:3]}.csv"
                 
                 st.download_button(
-                    label=f"📥 Download Sample PV Data (1 kWp) - {format_choice.split(' ')[0]} Format",
+                    label=f"📥 Download Sample PV (1 kWp) - {data_format[:3]} format",
                     data=csv,
                     file_name=file_name,
                     mime="text/csv",
@@ -794,9 +839,17 @@ pv_production_kw
                 st.write("**Preview (first day):**")
                 fig_data = pd.DataFrame({
                     'Hour': np.arange(0, 24, 0.25),
-                    'PV Production (kW)': pv_production[:96]
+                    f'PV ({data_format[:3]})': final_df.iloc[:96].values.flatten()
                 })
                 st.line_chart(fig_data.set_index('Hour'))
+                
+                # Show annual production
+                if data_format == "kWh (energy per 15-min interval)":
+                    annual_prod = final_df.sum().values[0]
+                else:
+                    annual_prod = final_df.sum().values[0] * 0.25
+                
+                st.info(f"Annual production (1 kWp): {annual_prod:.0f} kWh")
         
         # Consumption Profile
         st.subheader("3. Consumption Profile")
@@ -895,7 +948,7 @@ consumption_kWh
                 st.write("**Preview (first day):**")
                 fig_data = pd.DataFrame({
                     'Hour': np.arange(0, 24, 0.25),
-                    'Consumption (kWh)': sample_df['consumption_kWh'].iloc[:96]
+                    'Consumption (kWh)': sample_df['consumption_kWh'].iloc[:96].values
                 })
                 st.line_chart(fig_data.set_index('Hour'))
                 st.info(f"Annual consumption: {sample_df['consumption_kWh'].sum():.0f} kWh")
@@ -956,14 +1009,31 @@ consumption_kWh
                 st.error(f"❌ PV data error: {message}")
                 return
             else:
-                st.success(f"✅ PV data loaded: {message}")
+                # Show success with format info
+                format_type = "kWh per interval" if pv_baseline.attrs.get('is_kwh_format', False) else "kW instantaneous"
+                annual_prod = pv_baseline.attrs.get('annual_production', 0)
+                st.success(f"""
+                    ✅ PV data loaded successfully!
+                    - Format detected: **{format_type}**
+                    - Annual production: **{annual_prod:.0f} kWh/kWp**
+                    - {message}
+                """)
                 
                 # Show PV data statistics
                 with st.expander("📊 PV Production Statistics (1 kWp baseline)"):
                     col1, col2, col3, col4 = st.columns(4)
                     
-                    annual_pv = pv_baseline['pv_production_kwp'].sum() * 0.25
-                    peak_power = pv_baseline['pv_production_kwp'].max()
+                    # Get format info
+                    is_kwh_format = pv_baseline.attrs.get('is_kwh_format', False)
+                    annual_pv = pv_baseline.attrs.get('annual_production', 0)
+                    
+                    if is_kwh_format:
+                        peak_power = pv_baseline['pv_production_kwp'].max() * 4  # Convert to kW
+                        st.write(f"**Data format detected:** kWh per 15-min interval")
+                    else:
+                        peak_power = pv_baseline['pv_production_kwp'].max()
+                        st.write(f"**Data format detected:** kW instantaneous power")
+                    
                     capacity_factor = annual_pv / (1 * 8760) * 100  # 1 kWp * hours in year
                     
                     with col1:
@@ -981,7 +1051,8 @@ consumption_kWh
                     first_values = pv_baseline['pv_production_kwp'].head()
                     verification_df = pd.DataFrame({
                         'Index': range(len(first_values)),
-                        'Value (kW)': first_values.values
+                        'Raw Value': first_values.values,
+                        'Unit': ['kWh/15min' if is_kwh_format else 'kW'] * len(first_values)
                     })
                     st.dataframe(verification_df, use_container_width=False)
                     
@@ -989,14 +1060,25 @@ consumption_kWh
                     st.write("**Average Daily Profile (1 kWp):**")
                     hourly_avg = []
                     for h in range(24):
-                        hour_data = pv_baseline.iloc[h*4:(h+1)*4]['pv_production_kwp'].mean()
-                        hourly_avg.append(hour_data)
+                        hour_data = pv_baseline.iloc[h*4:(h+1)*4]['pv_production_kwp']
+                        if is_kwh_format:
+                            # Sum kWh values for the hour
+                            hourly_avg.append(hour_data.sum())
+                        else:
+                            # Average kW values for the hour
+                            hourly_avg.append(hour_data.mean())
                     
                     profile_df = pd.DataFrame({
                         'Hour': range(24),
-                        'Average Power (kW)': hourly_avg
+                        'Value': hourly_avg
                     })
-                    st.line_chart(profile_df.set_index('Hour'))
+                    
+                    if is_kwh_format:
+                        st.write("Hourly energy (kWh):")
+                    else:
+                        st.write("Average hourly power (kW):")
+                    
+                    st.line_chart(profile_df.set_index('Hour')['Value'])
             
             # Load consumption data
             # Try different separators to handle various CSV formats
@@ -1309,13 +1391,17 @@ Parameters Used:
             📁 **Please upload both files to begin:**
             
             1. **PV Production Data** (CSV)
-               - 35,040 rows of 15-minute PV production for 1 kWp system
-               - Values in kW
+               - 35,040 rows of 15-minute intervals
+               - Values for 1 kWp reference system
+               - **Accepts both formats:**
+                 - **kW** (instantaneous power): typical range 0-1 kW
+                 - **kWh** (energy per 15-min): typical range 0-0.25 kWh
+               - Auto-detects format based on value ranges
                - Single column with header
                
             2. **Consumption Data** (CSV)
                - Column named 'consumption_kWh'
-               - 35,040 rows of 15-minute consumption data
+               - 35,040 rows of 15-minute intervals
                - Values in kWh per interval
                
             ✅ **Supported CSV Formats:**
