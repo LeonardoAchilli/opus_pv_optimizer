@@ -29,25 +29,29 @@ def validate_pv_data(pv_df: pd.DataFrame) -> Tuple[bool, str, Optional[pd.DataFr
     # Use the first column as PV production data
     pv_column = pv_df.columns[0]
     
-    # Convert comma decimal separator to dot if needed
-    # First, check if the column contains strings with commas
-    if pv_df[pv_column].dtype == 'object':
-        # Replace comma with dot for decimal separator
-        # This handles European format (1,234 = 1.234)
-        pv_df[pv_column] = pv_df[pv_column].astype(str).str.replace(',', '.', regex=False)
-    
-    # Create a clean dataframe with standardized column name
-    try:
+    # Check if we need to convert values
+    # If the column is already numeric, no conversion needed
+    if pd.api.types.is_numeric_dtype(pv_df[pv_column]):
         clean_df = pd.DataFrame({
-            'pv_production_kwp': pd.to_numeric(pv_df[pv_column], errors='coerce')
+            'pv_production_kwp': pv_df[pv_column]
         })
-    except Exception as e:
-        return False, f"Error converting values to numbers: {str(e)}", None
-    
-    # Check for conversion errors
-    if clean_df['pv_production_kwp'].isna().sum() > 0:
-        n_errors = clean_df['pv_production_kwp'].isna().sum()
-        return False, f"Found {n_errors} values that couldn't be converted to numbers", None
+    else:
+        # Column contains strings, need to convert
+        # Replace comma with dot for decimal separator
+        pv_df[pv_column] = pv_df[pv_column].astype(str).str.replace(',', '.', regex=False)
+        
+        # Create a clean dataframe with standardized column name
+        try:
+            clean_df = pd.DataFrame({
+                'pv_production_kwp': pd.to_numeric(pv_df[pv_column], errors='coerce')
+            })
+        except Exception as e:
+            return False, f"Error converting values to numbers: {str(e)}", None
+        
+        # Check for conversion errors
+        if clean_df['pv_production_kwp'].isna().sum() > 0:
+            n_errors = clean_df['pv_production_kwp'].isna().sum()
+            return False, f"Found {n_errors} values that couldn't be converted to numbers", None
     
     # Check number of rows
     expected_rows = 35040
@@ -711,11 +715,25 @@ pv_production_kw
             """)
             
             st.info("""
-            💡 **Decimal Format Support:**
-            - European format: 1,234 (comma as decimal separator) ✅
-            - International format: 1.234 (dot as decimal separator) ✅
+            💡 **Supported CSV Formats:**
             
-            The system automatically detects and converts your format!
+            **Option 1 - Semicolon separator with comma decimal (European):**
+            ```
+            pv_production_kw
+            0,000
+            0,125
+            1,234
+            ```
+            
+            **Option 2 - Comma separator with dot decimal (International):**
+            ```
+            pv_production_kw
+            0.000
+            0.125
+            1.234
+            ```
+            
+            The system automatically detects your format!
             """)
             
             if st.button("📊 Generate Sample PV Data"):
@@ -747,11 +765,27 @@ pv_production_kw
                     'pv_production_kw': pv_production[:35040]  # Ensure exactly 35040 rows
                 })
                 
-                csv = pv_sample_df.to_csv(index=False)
+                # Let user choose format
+                format_choice = st.radio(
+                    "Choose CSV format:",
+                    ["International (comma separator, dot decimal)", 
+                     "European (semicolon separator, comma decimal)"],
+                    key="pv_format_choice"
+                )
+                
+                if format_choice == "European (semicolon separator, comma decimal)":
+                    # Convert to European format
+                    csv = pv_sample_df.to_csv(index=False, sep=';', decimal=',')
+                    file_name = "sample_pv_production_1kwp_EU.csv"
+                else:
+                    # Standard format
+                    csv = pv_sample_df.to_csv(index=False)
+                    file_name = "sample_pv_production_1kwp.csv"
+                
                 st.download_button(
-                    label="📥 Download Sample PV Data (1 kWp)",
+                    label=f"📥 Download Sample PV Data (1 kWp) - {format_choice.split(' ')[0]} Format",
                     data=csv,
-                    file_name="sample_pv_production_1kwp.csv",
+                    file_name=file_name,
                     mime="text/csv",
                     key="download_pv_sample"
                 )
@@ -791,6 +825,26 @@ consumption_kWh
 (35,040 rows total)
             """)
             
+            st.info("""
+            💡 **Supported CSV Formats:**
+            
+            **Option 1 - Semicolon separator with comma decimal (European):**
+            ```
+            consumption_kWh
+            0,125
+            0,130
+            1,234
+            ```
+            
+            **Option 2 - Comma separator with dot decimal (International):**
+            ```
+            consumption_kWh
+            0.125
+            0.130
+            1.234
+            ```
+            """)
+            
             if st.button("📊 Generate Sample Consumption Data"):
                 # Generate realistic consumption profile
                 hours = np.arange(0, 8760, 0.25)  # 15-min intervals for a year
@@ -812,11 +866,27 @@ consumption_kWh
                 target_annual = 10000  # kWh
                 sample_df['consumption_kWh'] = sample_df['consumption_kWh'] * (target_annual / current_annual)
                 
-                csv = sample_df.to_csv(index=False)
+                # Let user choose format
+                format_choice = st.radio(
+                    "Choose CSV format:",
+                    ["International (comma separator, dot decimal)", 
+                     "European (semicolon separator, comma decimal)"],
+                    key="cons_format_choice"
+                )
+                
+                if format_choice == "European (semicolon separator, comma decimal)":
+                    # Convert to European format
+                    csv = sample_df.to_csv(index=False, sep=';', decimal=',')
+                    file_name = "sample_consumption_data_EU.csv"
+                else:
+                    # Standard format
+                    csv = sample_df.to_csv(index=False)
+                    file_name = "sample_consumption_data.csv"
+                
                 st.download_button(
-                    label="📥 Download Sample Consumption Data",
+                    label=f"📥 Download Sample Consumption Data - {format_choice.split(' ')[0]} Format",
                     data=csv,
-                    file_name="sample_consumption_data.csv",
+                    file_name=file_name,
                     mime="text/csv",
                     key="download_consumption_sample"
                 )
@@ -866,7 +936,20 @@ consumption_kWh
     if pv_file is not None and consumption_file is not None:
         try:
             # Load and validate PV data
-            pv_df = pd.read_csv(pv_file)
+            # Try different separators to handle various CSV formats
+            try:
+                # First try with semicolon separator (common in European CSVs)
+                pv_df = pd.read_csv(pv_file, sep=';', decimal=',')
+            except:
+                try:
+                    # Then try with comma separator and dot decimal
+                    pv_file.seek(0)  # Reset file pointer
+                    pv_df = pd.read_csv(pv_file, sep=',', decimal='.')
+                except:
+                    # Finally try tab separator
+                    pv_file.seek(0)  # Reset file pointer
+                    pv_df = pd.read_csv(pv_file, sep='\t', decimal=',')
+            
             is_valid, message, pv_baseline = validate_pv_data(pv_df)
             
             if not is_valid:
@@ -916,15 +999,27 @@ consumption_kWh
                     st.line_chart(profile_df.set_index('Hour'))
             
             # Load consumption data
-            consumption_df = pd.read_csv(consumption_file)
+            # Try different separators to handle various CSV formats
+            try:
+                # First try with semicolon separator (common in European CSVs)
+                consumption_df = pd.read_csv(consumption_file, sep=';', decimal=',')
+            except:
+                try:
+                    # Then try with comma separator and dot decimal
+                    consumption_file.seek(0)  # Reset file pointer
+                    consumption_df = pd.read_csv(consumption_file, sep=',', decimal='.')
+                except:
+                    # Finally try tab separator
+                    consumption_file.seek(0)  # Reset file pointer
+                    consumption_df = pd.read_csv(consumption_file, sep='\t', decimal=',')
             
             if 'consumption_kWh' not in consumption_df.columns:
                 st.error("❌ Consumption CSV must contain 'consumption_kWh' column")
                 return
             
-            # Handle comma as decimal separator in consumption data
-            if consumption_df['consumption_kWh'].dtype == 'object':
-                # Replace comma with dot for decimal separator
+            # Handle comma as decimal separator in consumption data only if needed
+            if not pd.api.types.is_numeric_dtype(consumption_df['consumption_kWh']):
+                # Data is not numeric, need to convert
                 consumption_df['consumption_kWh'] = consumption_df['consumption_kWh'].astype(str).str.replace(',', '.', regex=False)
                 try:
                     consumption_df['consumption_kWh'] = pd.to_numeric(consumption_df['consumption_kWh'], errors='coerce')
@@ -991,7 +1086,24 @@ consumption_kWh
                 st.metric("Base Load", f"{consumption_df['consumption_kWh'].min()*4:,.1f} kW")
             
         except Exception as e:
-            st.error(f"❌ Error reading files: {str(e)}")
+            st.error(f"""
+                ❌ Error reading files: {str(e)}
+                
+                **Common causes:**
+                1. CSV uses semicolon (;) as separator → The system now handles this automatically
+                2. Numbers use comma as decimal separator → The system converts this automatically
+                3. Extra columns or spaces in the data → Check line 34 of your file
+                4. Special characters or formatting issues
+                
+                **Please check your CSV file format:**
+                - Should have only 1 column with header
+                - 35,040 data rows (no empty rows)
+                - No extra separators or columns
+                
+                **Supported formats:**
+                - Semicolon separator with comma decimal: `1,234;` ✅
+                - Comma separator with dot decimal: `1.234,` ✅
+            """)
             return
         
         # Run optimization
@@ -1199,15 +1311,20 @@ Parameters Used:
             1. **PV Production Data** (CSV)
                - 35,040 rows of 15-minute PV production for 1 kWp system
                - Values in kW
-               - ✅ Accepts comma (1,234) or dot (1.234) as decimal separator
+               - Single column with header
                
             2. **Consumption Data** (CSV)
                - Column named 'consumption_kWh'
                - 35,040 rows of 15-minute consumption data
                - Values in kWh per interval
-               - ✅ Accepts comma (1,234) or dot (1.234) as decimal separator
                
-            💡 **Note:** The system automatically detects and converts European decimal format!
+            ✅ **Supported CSV Formats:**
+            - **European**: Semicolon separator (;) with comma decimal (1,234)
+            - **International**: Comma separator (,) with dot decimal (1.234)
+            
+            The system automatically detects your format!
+            
+            ⚠️ **Important**: Each file should have only ONE column with data.
         """)
     
     # Footer
