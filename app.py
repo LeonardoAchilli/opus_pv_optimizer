@@ -13,6 +13,7 @@ from typing import Dict, Tuple, Optional, List
 def validate_pv_data(pv_df: pd.DataFrame) -> Tuple[bool, str, Optional[pd.DataFrame]]:
     """
     Validate PV production data from uploaded CSV.
+    Handles both comma and dot as decimal separator.
     
     Returns:
         Tuple of (is_valid, error_message, processed_dataframe)
@@ -28,10 +29,25 @@ def validate_pv_data(pv_df: pd.DataFrame) -> Tuple[bool, str, Optional[pd.DataFr
     # Use the first column as PV production data
     pv_column = pv_df.columns[0]
     
+    # Convert comma decimal separator to dot if needed
+    # First, check if the column contains strings with commas
+    if pv_df[pv_column].dtype == 'object':
+        # Replace comma with dot for decimal separator
+        # This handles European format (1,234 = 1.234)
+        pv_df[pv_column] = pv_df[pv_column].astype(str).str.replace(',', '.', regex=False)
+    
     # Create a clean dataframe with standardized column name
-    clean_df = pd.DataFrame({
-        'pv_production_kwp': pv_df[pv_column].astype(float)
-    })
+    try:
+        clean_df = pd.DataFrame({
+            'pv_production_kwp': pd.to_numeric(pv_df[pv_column], errors='coerce')
+        })
+    except Exception as e:
+        return False, f"Error converting values to numbers: {str(e)}", None
+    
+    # Check for conversion errors
+    if clean_df['pv_production_kwp'].isna().sum() > 0:
+        n_errors = clean_df['pv_production_kwp'].isna().sum()
+        return False, f"Found {n_errors} values that couldn't be converted to numbers", None
     
     # Check number of rows
     expected_rows = 35040
@@ -57,6 +73,14 @@ def validate_pv_data(pv_df: pd.DataFrame) -> Tuple[bool, str, Optional[pd.DataFr
     # Check if all values are zero
     if clean_df['pv_production_kwp'].sum() == 0:
         return False, "All PV production values are zero", None
+    
+    # Check if annual production is reasonable
+    annual_production = clean_df['pv_production_kwp'].sum() * 0.25  # kWh per year
+    if annual_production < 500:  # Less than 500 kWh/kWp/year is too low
+        return False, f"Annual production too low: {annual_production:.0f} kWh/kWp. Expected 800-1500 kWh/kWp for Europe", None
+    
+    if annual_production > 2000:  # More than 2000 kWh/kWp/year is too high
+        return False, f"Annual production too high: {annual_production:.0f} kWh/kWp. Expected 800-1500 kWh/kWp for Europe", None
     
     return True, "Valid PV production data", clean_df
 
@@ -662,6 +686,7 @@ def build_ui():
             📁 **Upload PV production baseline (1 kWp)**
             - 35,040 rows (15-min intervals)
             - Values in kW for 1 kWp system
+            - ✅ Supports both comma (1,234) and dot (1.234) as decimal separator
         """)
         
         pv_file = st.file_uploader(
@@ -683,6 +708,14 @@ pv_production_kw
 0.412
 ...
 (35,040 rows total)
+            """)
+            
+            st.info("""
+            💡 **Decimal Format Support:**
+            - European format: 1,234 (comma as decimal separator) ✅
+            - International format: 1.234 (dot as decimal separator) ✅
+            
+            The system automatically detects and converts your format!
             """)
             
             if st.button("📊 Generate Sample PV Data"):
@@ -737,6 +770,7 @@ pv_production_kw
             📁 **Upload consumption data**
             - Column named 'consumption_kWh'
             - 35,040 rows (15-min intervals)
+            - ✅ Supports both comma (1,234) and dot (1.234) as decimal separator
         """)
         
         consumption_file = st.file_uploader(
@@ -859,6 +893,15 @@ consumption_kWh
                         daylight_hours = (pv_baseline['pv_production_kwp'] > 0).sum() / 4
                         st.metric("Daylight Hours", f"{daylight_hours:.0f}")
                     
+                    # Show data format verification
+                    st.write("**Data Format Verification (first 5 values):**")
+                    first_values = pv_baseline['pv_production_kwp'].head()
+                    verification_df = pd.DataFrame({
+                        'Index': range(len(first_values)),
+                        'Value (kW)': first_values.values
+                    })
+                    st.dataframe(verification_df, use_container_width=False)
+                    
                     # Show daily profile
                     st.write("**Average Daily Profile (1 kWp):**")
                     hourly_avg = []
@@ -879,6 +922,22 @@ consumption_kWh
                 st.error("❌ Consumption CSV must contain 'consumption_kWh' column")
                 return
             
+            # Handle comma as decimal separator in consumption data
+            if consumption_df['consumption_kWh'].dtype == 'object':
+                # Replace comma with dot for decimal separator
+                consumption_df['consumption_kWh'] = consumption_df['consumption_kWh'].astype(str).str.replace(',', '.', regex=False)
+                try:
+                    consumption_df['consumption_kWh'] = pd.to_numeric(consumption_df['consumption_kWh'], errors='coerce')
+                    
+                    # Check for conversion errors
+                    n_errors = consumption_df['consumption_kWh'].isna().sum()
+                    if n_errors > 0:
+                        st.warning(f"⚠️ Found {n_errors} values that couldn't be converted to numbers. They will be treated as 0.")
+                        consumption_df['consumption_kWh'] = consumption_df['consumption_kWh'].fillna(0)
+                except Exception as e:
+                    st.error(f"❌ Error converting consumption values: {str(e)}")
+                    return
+            
             # Validate and adjust consumption data length
             expected_rows = 35040
             if len(consumption_df) != expected_rows:
@@ -889,6 +948,33 @@ consumption_kWh
                     # Repeat pattern to fill
                     repeats = (expected_rows // len(consumption_df)) + 1
                     consumption_df = pd.concat([consumption_df] * repeats).iloc[:expected_rows].reset_index(drop=True)
+            
+            # Validate consumption data is reasonable
+            annual_consumption = consumption_df['consumption_kWh'].sum()
+            if annual_consumption > 100000:  # More than 100 MWh/year
+                st.warning(f"""
+                    ⚠️ **Very high consumption detected:** {annual_consumption:,.0f} kWh/year
+                    
+                    This seems like industrial consumption. Typical values:
+                    - Residential: 3,000-10,000 kWh/year
+                    - Small business: 10,000-50,000 kWh/year
+                    - Large business: 50,000-500,000 kWh/year
+                    
+                    Please verify your data units are correct (kWh per 15-min interval).
+                """)
+            
+            # Check for unrealistic peak values
+            peak_power = consumption_df['consumption_kWh'].max() * 4  # Convert to kW
+            if peak_power > 100:  # More than 100 kW peak
+                st.warning(f"""
+                    ⚠️ **Very high peak power:** {peak_power:.1f} kW
+                    
+                    Typical peak power:
+                    - Residential: 3-10 kW
+                    - Small business: 10-50 kW
+                    
+                    Your data might be in Wh instead of kWh.
+                """)
             
             # Display consumption statistics
             st.subheader("📊 Consumption Profile Summary")
@@ -1113,11 +1199,15 @@ Parameters Used:
             1. **PV Production Data** (CSV)
                - 35,040 rows of 15-minute PV production for 1 kWp system
                - Values in kW
+               - ✅ Accepts comma (1,234) or dot (1.234) as decimal separator
                
             2. **Consumption Data** (CSV)
                - Column named 'consumption_kWh'
                - 35,040 rows of 15-minute consumption data
                - Values in kWh per interval
+               - ✅ Accepts comma (1,234) or dot (1.234) as decimal separator
+               
+            💡 **Note:** The system automatically detects and converts European decimal format!
         """)
     
     # Footer
