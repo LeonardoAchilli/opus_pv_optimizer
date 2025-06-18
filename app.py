@@ -10,48 +10,51 @@ from typing import Dict, Tuple, Optional, List
 # SECTION 1: BACKEND LOGIC - VERSION 3.0 WITH TXT SUPPORT
 # ==============================================================================
 
-def load_txt_file(uploaded_file, expected_rows: int = 35040) -> Tuple[bool, str, Optional[np.ndarray]]:
+from typing import Tuple, Optional
+import numpy as np
+
+def load_txt_file(uploaded_file,
+                  expected_rows: int = 35040
+                 ) -> Tuple[bool, str, Optional[np.ndarray]]:
     """
-    Load data from TXT file with European decimal format.
-    Expects one value per line with comma as decimal separator.
-    
-    Returns:
-        Tuple of (is_valid, error_message, data_array)
+    Legge un file TXT in formato decimale europeo (virgola come separatore).
+    Ritorna (ok, messaggio_errore, array_valori) .
     """
     try:
-        # Read file content
-        content = uploaded_file.read().decode('utf-8')
-        lines = content.strip().split('\n')
-        
-        # Parse values - handle comma as decimal separator
-        values = []
-        for i, line in enumerate(lines):
-            line = line.strip()
-            if line:  # Skip empty lines
-                try:
-                    # Replace comma with dot for parsing
-                    value = float(line.replace(',', '.'))
-                    values.append(value)
-                except ValueError as e:
-                    return False, f"Error parsing line {i+1}: '{line}' is not a valid number. Original error: {e}", None
-        
-        # Convert to numpy array
-        data_array = np.array(values, dtype=np.float32)
-        
-        # Validate number of rows
-        if len(data_array) != expected_rows:
-            return False, f"Expected {expected_rows:,} values, found {len(data_array):,}", None
-        
-        # Validate no negative values
-        if np.any(data_array < 0):
-            return False, "Negative values found in data", None
-        
-        return True, "Data loaded successfully", data_array
-        
-    except Exception as e:
-        return False, f"Error reading file: {str(e)}", None
+        # 1) leggi il contenuto
+        content = uploaded_file.read().decode("utf-8")
+        lines = content.strip().split("\n")
 
+        # 2) converti riga per riga
+        values = []
+        for idx, raw in enumerate(lines, start=1):
+            raw = raw.strip()
+            if not raw:          # salta righe vuote
+                continue
+            try:
+                values.append(float(raw.replace(",", ".")))
+            except ValueError:
+                return (False,
+                        f"Valore non numerico alla riga {idx}: «{raw}»",
+                        None)
+
+        # 3) verifica il numero di righe attese
+        if len(values) != expected_rows:
+            return (False,
+                    f"Righe lette {len(values)}, attese {expected_rows}",
+                    None)
+
+        # 4) tutto ok
+        return (True, "", np.array(values, dtype=float))
+
+    except Exception as e:               # <-- chiude il try esterno
+        return (False, f"Errore imprevisto: {e}", None)
+
+
+
+# ==============================================================================
 # SECTION 2: STREAMLIT UI - VERSION 3.0 WITH TXT SUPPORT
+# ==============================================================================
 
 def build_ui():
     """Streamlit UI with TXT file support."""
@@ -610,6 +613,7 @@ Parameters Used:
     """, unsafe_allow_html=True)
 
 
+if __name__ == "__main__":
     build_ui() False, f"Error parsing line {i+1}: '{line}' is not a valid number", None
         
         # Convert to numpy array
@@ -1325,8 +1329,3 @@ def generate_sample_txt_file(data_type: str, annual_value: float = None) -> str:
         lines.append(formatted_value)
     
     return '\n'.join(lines)
-
-if __name__ == "__main__":
-    build_ui()
-
-[end of app.py]
