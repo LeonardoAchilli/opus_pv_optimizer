@@ -33,12 +33,25 @@ def load_txt_file(uploaded_file, expected_rows: int = 35040) -> Tuple[bool, str,
                     value = float(line.replace(',', '.'))
                     values.append(value)
                 except ValueError as e:
-                    return '\n'.join(lines)
+                    return False, f"Error parsing line {i+1}: '{line}' is not a valid number. Original error: {e}", None
+        
+        # Convert to numpy array
+        data_array = np.array(values, dtype=np.float32)
+        
+        # Validate number of rows
+        if len(data_array) != expected_rows:
+            return False, f"Expected {expected_rows:,} values, found {len(data_array):,}", None
+        
+        # Validate no negative values
+        if np.any(data_array < 0):
+            return False, "Negative values found in data", None
+        
+        return True, "Data loaded successfully", data_array
+        
+    except Exception as e:
+        return False, f"Error reading file: {str(e)}", None
 
-
-# ==============================================================================
 # SECTION 2: STREAMLIT UI - VERSION 3.0 WITH TXT SUPPORT
-# ==============================================================================
 
 def build_ui():
     """Streamlit UI with TXT file support."""
@@ -597,7 +610,6 @@ Parameters Used:
     """, unsafe_allow_html=True)
 
 
-if __name__ == "__main__":
     build_ui() False, f"Error parsing line {i+1}: '{line}' is not a valid number", None
         
         # Convert to numpy array
@@ -1313,3 +1325,8 @@ def generate_sample_txt_file(data_type: str, annual_value: float = None) -> str:
         lines.append(formatted_value)
     
     return '\n'.join(lines)
+
+if __name__ == "__main__":
+    build_ui()
+
+[end of app.py]
