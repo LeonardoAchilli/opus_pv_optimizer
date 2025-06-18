@@ -614,8 +614,9 @@ Parameters Used:
 
 
 if __name__ == "__main__":
-    build_ui() False, f"Error parsing line {i+1}: '{line}' is not a valid number", None
-        
+
+    build_ui()
+
         # Convert to numpy array
         data_array = np.array(values, dtype=np.float32)
         
