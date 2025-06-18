@@ -7,78 +7,161 @@ import zipfile
 from typing import Dict, Tuple, Optional, List
 
 # ==============================================================================
-# SECTION 1: BACKEND LOGIC - OPTIMIZED VERSION
+# SECTION 1: BACKEND LOGIC - VERSION 3.0 WITH TXT SUPPORT
 # ==============================================================================
 
-def validate_pv_data(pv_df: pd.DataFrame) -> Tuple[bool, str, Optional[pd.DataFrame]]:
+def load_txt_file(uploaded_file, expected_rows: int = 35040) -> Tuple[bool, str, Optional[np.ndarray]]:
     """
-    Validate PV production data from uploaded CSV.
-    Expects kWh values per 15-minute interval for 1 kWp system.
+    Load data from TXT file with European decimal format.
+    Expects one value per line with comma as decimal separator.
     
     Returns:
-        Tuple of (is_valid, error_message, processed_dataframe)
+        Tuple of (is_valid, error_message, data_array)
     """
-    # Check if dataframe has any columns
-    if pv_df.empty:
-        return False, "File is empty", None
-    
-    # Get the first column regardless of name
-    if len(pv_df.columns) == 0:
-        return False, "No columns found in CSV", None
-    
-    # Use the first column as PV production data
-    pv_column = pv_df.columns[0]
-    
-    # Create a clean dataframe with standardized column name
     try:
-        clean_df = pd.DataFrame({
-            'pv_production_kwp': pd.to_numeric(pv_df[pv_column], errors='coerce')
-        })
+        # Read file content
+        content = uploaded_file.read().decode('utf-8')
+        lines = content.strip().split('\n')
+        
+        # Parse values - handle comma as decimal separator
+        values = []
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if line:  # Skip empty lines
+                try:
+                    # Replace comma with dot for parsing
+                    value = float(line.replace(',', '.'))
+                    values.append(value)
+                except ValueError as e:
+                    return False, f"Error parsing line {i+1}: '{line}' is not a valid number", None
+        
+        # Convert to numpy array
+        data_array = np.array(values, dtype=np.float32)
+        
+        # Validate number of rows
+        if len(data_array) != expected_rows:
+            return False, f"Expected {expected_rows:,} values, found {len(data_array):,}", None
+        
+        # Validate no negative values
+        if np.any(data_array < 0):
+            return False, "Negative values found in data", None
+        
+        return True, "Data loaded successfully", data_array
+        
     except Exception as e:
-        return False, f"Error converting values to numbers: {str(e)}", None
+        return False, f"Error reading file: {str(e)}", None
+
+
+def validate_pv_txt_data(pv_data: np.ndarray) -> Tuple[bool, str, Dict]:
+    """
+    Validate PV production data from TXT file.
+    Data should be for 1 kWp system with values in kWh per 15-minute interval.
     
-    # Check for conversion errors
-    if clean_df['pv_production_kwp'].isna().sum() > 0:
-        n_errors = clean_df['pv_production_kwp'].isna().sum()
-        return False, f"Found {n_errors} values that couldn't be converted to numbers", None
-    
-    # Check number of rows
-    expected_rows = 35040
-    actual_rows = len(clean_df)
-    
-    if actual_rows != expected_rows:
-        return False, f"Expected {expected_rows:,} rows (15-min intervals for 1 year), found {actual_rows:,}", None
-    
-    # Validate data range
-    if clean_df['pv_production_kwp'].min() < 0:
-        return False, "Negative values found in PV production data", None
-    
+    Returns:
+        Tuple of (is_valid, error_message, metadata_dict)
+    """
     # Calculate annual production
-    annual_production = clean_df['pv_production_kwp'].sum()
+    annual_production = pv_data.sum()
     
     # Check if all values are zero
     if annual_production == 0:
         return False, "All PV production values are zero", None
     
-    # Check if annual production is reasonable (expecting around 1373 kWh for 1 kWp)
-    if annual_production < 800:  # Less than 800 kWh/kWp/year is too low
+    # Check if annual production is reasonable for 1 kWp
+    if annual_production < 800:
         return False, f"Annual production too low: {annual_production:.0f} kWh/kWp. Expected 800-1800 kWh/kWp", None
     
-    if annual_production > 2000:  # More than 2000 kWh/kWp/year is too high
+    if annual_production > 2000:
         return False, f"Annual production too high: {annual_production:.0f} kWh/kWp. Expected 800-1800 kWh/kWp", None
     
-    # Store metadata
-    clean_df.attrs['annual_production'] = annual_production
+    # Calculate peak value
+    peak_value = pv_data.max()
     
-    return True, f"Valid PV data - Annual production: {annual_production:.0f} kWh/kWp", clean_df
+    # Validate peak is reasonable (should be < 0.25 kWh for 15-min interval of 1 kWp)
+    if peak_value > 0.3:
+        return False, f"Peak value too high: {peak_value:.3f} kWh. Expected < 0.3 kWh for 15-min interval", None
+    
+    # Calculate metadata
+    metadata = {
+        'annual_production': annual_production,
+        'peak_value': peak_value,
+        'capacity_factor': (annual_production / (1 * 8760)) * 100,  # % of theoretical maximum
+        'daylight_intervals': int((pv_data > 0).sum()),
+        'daylight_hours': (pv_data > 0).sum() / 4
+    }
+    
+    return True, f"Valid PV data - Annual production: {annual_production:.0f} kWh/kWp", metadata
 
 
-def run_simulation_vectorized(pv_kwp: float, bess_kwh_nominal: float, pv_production_baseline: pd.DataFrame, 
-                            consumption_profile: pd.DataFrame, config: Dict, 
-                            export_details: bool = False, debug: bool = False) -> Dict:
+def validate_consumption_txt_data(consumption_data: np.ndarray) -> Tuple[bool, str, Dict]:
     """
-    Optimized vectorized simulation with exact energy flow formulas.
-    Handles both kW and kWh input formats for PV data.
+    Validate consumption data from TXT file.
+    
+    Returns:
+        Tuple of (is_valid, error_message, metadata_dict)
+    """
+    # Calculate annual consumption
+    annual_consumption = consumption_data.sum()
+    
+    # Check if consumption is reasonable
+    if annual_consumption == 0:
+        return False, "All consumption values are zero", None
+    
+    if annual_consumption > 1000000:  # More than 1 GWh/year
+        return False, f"Consumption unrealistically high: {annual_consumption:,.0f} kWh/year", None
+    
+    # Calculate peak load
+    peak_load = consumption_data.max() * 4  # Convert to kW
+    
+    # Calculate metadata
+    metadata = {
+        'annual_consumption': annual_consumption,
+        'daily_average': annual_consumption / 365,
+        'peak_load_kw': peak_load,
+        'base_load_kw': consumption_data.min() * 4,
+        'load_factor': (annual_consumption / (peak_load * 8760)) * 100 if peak_load > 0 else 0
+    }
+    
+    return True, f"Valid consumption data - Annual: {annual_consumption:,.0f} kWh", metadata
+
+
+def prepare_5year_simulation_data(pv_baseline: np.ndarray, consumption_baseline: np.ndarray, 
+                                 pv_degradation_rate: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Prepare 5-year arrays for simulation with PV degradation.
+    
+    Returns:
+        Tuple of (pv_5years, consumption_5years)
+    """
+    steps_per_year = 35040
+    total_steps = steps_per_year * 5
+    
+    # Initialize arrays
+    pv_5years = np.zeros(total_steps, dtype=np.float32)
+    consumption_5years = np.zeros(total_steps, dtype=np.float32)
+    
+    # Fill data year by year
+    for year in range(5):
+        start_idx = year * steps_per_year
+        end_idx = start_idx + steps_per_year
+        
+        # Apply PV degradation
+        degradation_factor = (1 - pv_degradation_rate) ** year
+        pv_5years[start_idx:end_idx] = pv_baseline * degradation_factor
+        
+        # Consumption remains constant
+        consumption_5years[start_idx:end_idx] = consumption_baseline
+    
+    return pv_5years, consumption_5years
+
+
+def run_simulation_vectorized_v3(pv_kwp: float, bess_kwh_nominal: float, 
+                               pv_baseline: np.ndarray, consumption_baseline: np.ndarray,
+                               config: Dict, export_details: bool = False, 
+                               debug: bool = False) -> Dict:
+    """
+    Optimized simulation with 5-year data preparation and TXT file support.
+    All calculations use the Excel-like column approach.
     """
     # Extract configuration parameters
     dod = config['bess_dod']
@@ -92,155 +175,131 @@ def run_simulation_vectorized(pv_kwp: float, bess_kwh_nominal: float, pv_product
     kwh_netti = bess_kwh_nominal * dod  # Usable capacity
     max_charge_discharge_per_step = bess_kwh_nominal * c_rate / 4  # C-rate limit for 15-min step
     
-    # Convert data to numpy arrays for faster computation
-    pv_base = pv_production_baseline['pv_production_kwp'].to_numpy(dtype=np.float32)
-    cons = consumption_profile['consumption_kWh'].to_numpy(dtype=np.float32)
+    # Prepare 5-year data with degradation
+    pv_5years, consumption_5years = prepare_5year_simulation_data(
+        pv_baseline, consumption_baseline, pv_degr_rate
+    )
     
-    # Check if PV data is already in kWh format
-    is_kwh_format = pv_production_baseline.attrs.get('is_kwh_format', False)
+    # Scale PV by system size
+    pv_production_5years = pv_5years * pv_kwp
     
     # Debug information
     if debug:
         st.write("### 🔍 Debug Information - Simulation Input")
         st.write(f"**PV System:** {pv_kwp} kWp")
         st.write(f"**Battery:** {bess_kwh_nominal} kWh (usable: {kwh_netti:.1f} kWh)")
-        st.write(f"**PV data format:** {'kWh per interval' if is_kwh_format else 'kW instantaneous'}")
-        st.write(f"**PV baseline data points:** {len(pv_base)}")
+        st.write(f"**Annual PV production (Year 1):** {pv_production_5years[:35040].sum():.0f} kWh")
+        st.write(f"**Annual consumption:** {consumption_baseline.sum():.0f} kWh")
+    
+    # Initialize tracking arrays for entire 5-year period
+    total_steps = len(pv_production_5years)
+    steps_per_year = 35040
+    
+    soc = np.zeros(total_steps + 1, dtype=np.float32)
+    soh = np.zeros(total_steps + 1, dtype=np.float32)
+    kwh_scaricati = np.zeros(total_steps, dtype=np.float32)
+    kwh_caricati = np.zeros(total_steps, dtype=np.float32)
+    immissione = np.zeros(total_steps, dtype=np.float32)
+    acquisto = np.zeros(total_steps, dtype=np.float32)
+    
+    # Set initial SoH
+    soh[0] = 1.0
+    
+    # Simulate each 15-minute step for 5 years
+    for t in range(total_steps):
+        produzione = pv_production_5years[t]
+        consumo = consumption_5years[t]
         
-        if is_kwh_format:
-            annual_prod_1kwp = pv_base.sum()
+        # Current max SoC based on battery health
+        max_soc_current = kwh_netti * soh[t]
+        
+        # 1. Calculate battery discharge
+        if consumo > produzione:
+            energy_deficit = (consumo - produzione) / efficiency
+            kwh_scaricati[t] = min(energy_deficit, soc[t], max_charge_discharge_per_step)
         else:
-            annual_prod_1kwp = pv_base.sum() * 0.25
+            kwh_scaricati[t] = 0
         
-        st.write(f"**PV baseline stats (1 kWp):**")
-        st.write(f"  - Annual production: {annual_prod_1kwp:.0f} kWh")
-        st.write(f"  - Peak value: {pv_base.max():.3f} {'kWh/interval' if is_kwh_format else 'kW'}")
-        st.write(f"  - Non-zero values: {(pv_base > 0).sum()} of {len(pv_base)}")
+        # 2. Calculate grid export
+        if produzione > consumo:
+            excess_after_battery = soc[t] + produzione - consumo - max_soc_current
+            immissione[t] = max(0, excess_after_battery)
+        else:
+            immissione[t] = 0
+        
+        # 3. Calculate grid import
+        energy_from_battery = kwh_scaricati[t] * efficiency
+        acquisto[t] = max(0, consumo - produzione - energy_from_battery)
+        
+        # 4. Update SoC
+        if produzione >= consumo:
+            delta_soc = (produzione - consumo) * efficiency
+            actual_charge = min(delta_soc, max_soc_current - soc[t], max_charge_discharge_per_step)
+            soc[t+1] = soc[t] + actual_charge
+            kwh_caricati[t] = actual_charge / efficiency
+        else:
+            soc[t+1] = soc[t] - kwh_scaricati[t]
+            kwh_caricati[t] = 0
+        
+        # 5. Calculate SoH degradation
+        if t > 0:
+            cycle_degradation = (kwh_scaricati[t-1] / bess_kwh_nominal) * (0.2 * 1.15 / tot_cycles)
+        else:
+            cycle_degradation = 0
+        
+        calendar_deg_per_step = calendar_degradation / steps_per_year
+        soh[t+1] = max(0, soh[t] - calendar_deg_per_step - cycle_degradation)
     
-    # Calculate base case annual cost
-    annual_consumption = cons.sum()
-    base_case_annual_cost = annual_consumption * config['grid_price_buy']
-    
-    # Simulation parameters
-    steps_per_year = 35040  # 96 steps/day * 365 days
-    
-    # Initialize tracking variables
+    # Calculate annual metrics
     annual_metrics = []
-    total_grid_import = 0
-    total_consumption = annual_consumption * 5  # 5 years total
+    annual_consumption = consumption_baseline.sum()
     
-    # Pre-calculate PV degradation factors
-    pv_degradation_factors = (1 - pv_degr_rate) ** np.arange(5)
-    
-    # Store detailed timestep data if requested
-    timestep_data = [] if export_details else None
-    
-    # Run 5-year simulation
     for year in range(5):
-        # Apply PV degradation and scale by system size
-        if is_kwh_format:
-            # Data is already in kWh per 15-min interval
-            pv_production = pv_base * pv_kwp * pv_degradation_factors[year]
-        else:
-            # Data is in kW, convert to kWh per 15-min
-            pv_production = pv_base * pv_kwp * pv_degradation_factors[year] * 0.25
+        start_idx = year * steps_per_year
+        end_idx = start_idx + steps_per_year
         
-        if debug and year == 0:
-            st.write(f"**Year 1 PV production:**")
-            st.write(f"  - Total: {pv_production.sum():.0f} kWh")
-            st.write(f"  - Degradation factor: {pv_degradation_factors[year]:.3f}")
-        
-        # Initialize arrays for this year
-        soc = np.zeros(steps_per_year + 1, dtype=np.float32)
-        soh = np.zeros(steps_per_year + 1, dtype=np.float32)
-        kwh_scaricati = np.zeros(steps_per_year, dtype=np.float32)
-        kwh_caricati = np.zeros(steps_per_year, dtype=np.float32)
-        immissione = np.zeros(steps_per_year, dtype=np.float32)
-        acquisto = np.zeros(steps_per_year, dtype=np.float32)
-        
-        # Set initial SoH
-        soh[0] = 1.0 if year == 0 else annual_metrics[-1]['final_soh']
-        
-        # Simulate each 15-minute step
-        for t in range(steps_per_year):
-            produzione = pv_production[t]
-            consumo = cons[t]
-            
-            # Current max SoC based on battery health
-            max_soc_current = kwh_netti * soh[t]
-            
-            # 1. Calculate battery discharge
-            if consumo > produzione:
-                energy_deficit = (consumo - produzione) / efficiency
-                kwh_scaricati[t] = min(energy_deficit, soc[t], max_charge_discharge_per_step)
-            else:
-                kwh_scaricati[t] = 0
-            
-            # 2. Calculate grid export
-            if produzione > consumo:
-                excess_after_battery = soc[t] + produzione - consumo - max_soc_current
-                immissione[t] = max(0, excess_after_battery)
-            else:
-                immissione[t] = 0
-            
-            # 3. Calculate grid import
-            energy_from_battery = kwh_scaricati[t] * efficiency
-            acquisto[t] = max(0, consumo - produzione - energy_from_battery)
-            
-            # 4. Update SoC
-            if produzione >= consumo:
-                delta_soc = (produzione - consumo) * efficiency
-                actual_charge = min(delta_soc, max_soc_current - soc[t], max_charge_discharge_per_step)
-                soc[t+1] = soc[t] + actual_charge
-                kwh_caricati[t] = actual_charge / efficiency
-            else:
-                soc[t+1] = soc[t] - kwh_scaricati[t]
-                kwh_caricati[t] = 0
-            
-            # 5. Calculate SoH degradation
-            if t > 0:
-                cycle_degradation = (kwh_scaricati[t-1] / bess_kwh_nominal) * (0.2 * 1.15 / tot_cycles)
-            else:
-                cycle_degradation = 0
-            
-            calendar_deg_per_step = calendar_degradation / steps_per_year
-            soh[t+1] = max(0, soh[t] - calendar_deg_per_step - cycle_degradation)
-            
-            # Store timestep data if requested (daily aggregation)
-            if export_details and t % 96 == 0:
-                day_slice = slice(t, min(t + 96, steps_per_year))
-                timestep_data.append({
-                    'year': year + 1,
-                    'day': t // 96 + 1,
-                    'pv_production_kwh': pv_production[day_slice].sum(),
-                    'consumption_kwh': cons[day_slice].sum(),
-                    'battery_charge_kwh': kwh_caricati[day_slice].sum(),
-                    'battery_discharge_kwh': (kwh_scaricati[day_slice] * efficiency).sum(),
-                    'grid_import_kwh': acquisto[day_slice].sum(),
-                    'grid_export_kwh': immissione[day_slice].sum(),
-                    'avg_soc_kwh': soc[t:t+96].mean(),
-                    'soh_percent': soh[t] * 100
-                })
-        
-        # Calculate annual totals
         yearly_metrics = {
             'year': year + 1,
-            'pv_production': pv_production.sum(),
+            'pv_production': pv_production_5years[start_idx:end_idx].sum(),
             'consumption': annual_consumption,
-            'energy_bought': acquisto.sum(),
-            'energy_sold': immissione.sum(),
-            'energy_to_battery': kwh_caricati.sum(),
-            'energy_from_battery': (kwh_scaricati * efficiency).sum(),
-            'self_consumption': annual_consumption - acquisto.sum(),
-            'self_sufficiency': (annual_consumption - acquisto.sum()) / annual_consumption if annual_consumption > 0 else 0,
-            'final_soh': soh[steps_per_year],
-            'avg_soc': soc[1:steps_per_year+1].mean(),
-            'max_soc': soc[1:steps_per_year+1].max(),
-            'min_soc': soc[1:steps_per_year+1].min()
+            'energy_bought': acquisto[start_idx:end_idx].sum(),
+            'energy_sold': immissione[start_idx:end_idx].sum(),
+            'energy_to_battery': kwh_caricati[start_idx:end_idx].sum(),
+            'energy_from_battery': (kwh_scaricati[start_idx:end_idx] * efficiency).sum(),
+            'self_consumption': annual_consumption - acquisto[start_idx:end_idx].sum(),
+            'self_sufficiency': 0,  # Will calculate below
+            'final_soh': soh[end_idx],
+            'avg_soc': soc[start_idx+1:end_idx+1].mean(),
+            'max_soc': soc[start_idx+1:end_idx+1].max(),
+            'min_soc': soc[start_idx+1:end_idx+1].min()
         }
         
+        # Calculate self-sufficiency
+        if annual_consumption > 0:
+            yearly_metrics['self_sufficiency'] = yearly_metrics['self_consumption'] / annual_consumption
+        
         annual_metrics.append(yearly_metrics)
-        total_grid_import += yearly_metrics['energy_bought']
+    
+    # Store detailed timestep data if requested
+    timestep_data = []
+    if export_details:
+        for year in range(5):
+            for day in range(365):
+                day_start = year * steps_per_year + day * 96
+                day_end = day_start + 96
+                
+                timestep_data.append({
+                    'year': year + 1,
+                    'day': day + 1,
+                    'pv_production_kwh': pv_production_5years[day_start:day_end].sum(),
+                    'consumption_kwh': consumption_5years[day_start:day_end].sum(),
+                    'battery_charge_kwh': kwh_caricati[day_start:day_end].sum(),
+                    'battery_discharge_kwh': (kwh_scaricati[day_start:day_end] * efficiency).sum(),
+                    'grid_import_kwh': acquisto[day_start:day_end].sum(),
+                    'grid_export_kwh': immissione[day_start:day_end].sum(),
+                    'avg_soc_kwh': soc[day_start:day_end].mean(),
+                    'soh_percent': soh[day_start] * 100
+                })
     
     # Calculate financial metrics
     capex_pv = pv_kwp * (600 + 600 * np.exp(-pv_kwp / 290))
@@ -286,9 +345,12 @@ def run_simulation_vectorized(pv_kwp: float, bess_kwh_nominal: float, pv_product
             break
     
     # Calculate base case NPV
+    base_case_annual_cost = annual_consumption * config['grid_price_buy']
     base_case_npv = -sum(base_case_annual_cost / ((1 + wacc) ** (i + 1)) for i in range(10))
     
     # Overall self-sufficiency rate
+    total_consumption = annual_consumption * 5
+    total_grid_import = acquisto.sum()
     self_sufficiency_rate = (total_consumption - total_grid_import) / total_consumption if total_consumption > 0 else 0
     
     result = {
@@ -315,10 +377,10 @@ def run_simulation_vectorized(pv_kwp: float, bess_kwh_nominal: float, pv_product
     return result
 
 
-def find_optimal_system(user_inputs: Dict, config: Dict, pv_baseline: pd.DataFrame, 
-                       enable_debug: bool = False) -> Optional[Dict]:
+def find_optimal_system_v3(user_inputs: Dict, config: Dict, pv_baseline: np.ndarray, 
+                          consumption_baseline: np.ndarray, enable_debug: bool = False) -> Optional[Dict]:
     """
-    Optimized system search with adaptive grid search.
+    Optimized system search for TXT-based inputs.
     """
     # Calculate maximum feasible sizes
     max_kwp_from_area = user_inputs['available_area_m2'] / 5.0  # 5 m²/kWp
@@ -375,9 +437,8 @@ def find_optimal_system(user_inputs: Dict, config: Dict, pv_baseline: pd.DataFra
             valid_solutions += 1
             
             # Run simulation
-            result = run_simulation_vectorized(
-                pv_kwp, bess_kwh, pv_baseline, 
-                user_inputs['consumption_profile_df'], 
+            result = run_simulation_vectorized_v3(
+                pv_kwp, bess_kwh, pv_baseline, consumption_baseline,
                 config, debug=(enable_debug and valid_solutions == 1)
             )
             
@@ -617,14 +678,86 @@ Energy flow calculation (per 15-minute interval):
     return zip_buffer
 
 
+def generate_sample_txt_file(data_type: str, annual_value: float = None) -> str:
+    """
+    Generate sample TXT file content for PV or consumption data.
+    
+    Args:
+        data_type: 'pv' or 'consumption'
+        annual_value: Target annual value in kWh
+    """
+    if data_type == 'pv':
+        # Generate realistic PV profile for 1 kWp
+        hours = np.arange(0, 8760, 0.25)  # 15-min intervals
+        
+        # Solar profile: zero at night, bell curve during day
+        daily_pattern = np.zeros(96)  # 96 intervals per day
+        sunrise = 24  # 6 AM
+        sunset = 72   # 6 PM
+        
+        for i in range(sunrise, sunset):
+            angle = (i - sunrise) * np.pi / (sunset - sunrise)
+            # Peak at ~0.21 kWh for 15-min interval (0.85 kW * 0.25h)
+            daily_pattern[i] = 0.21 * np.sin(angle) ** 1.5
+        
+        # Add seasonal variation
+        pv_production = []
+        for day in range(365):
+            seasonal_factor = 0.7 + 0.3 * np.cos((day - 172) * 2 * np.pi / 365)  # Peak in summer
+            daily_production = daily_pattern * seasonal_factor
+            
+            # Add some random variation
+            daily_production *= (0.9 + 0.2 * np.random.random())
+            
+            pv_production.extend(daily_production)
+        
+        values = np.array(pv_production[:35040])
+        
+        # Scale to target annual if specified (default ~1373 kWh for 1 kWp)
+        if annual_value is None:
+            annual_value = 1373
+        
+        current_annual = values.sum()
+        values = values * (annual_value / current_annual)
+        
+    else:  # consumption
+        # Generate realistic consumption profile
+        hours = np.arange(0, 8760, 0.25)  # 15-min intervals for a year
+        
+        # Base load + daily pattern + seasonal variation + noise
+        base_load = 0.3
+        daily_pattern = 0.4 * np.sin((hours % 24 - 6) * np.pi / 12) ** 2
+        seasonal_pattern = 0.2 * np.cos((hours / 8760) * 2 * np.pi)
+        noise = np.random.normal(0, 0.05, len(hours))
+        
+        consumption = np.maximum(0, base_load + daily_pattern + seasonal_pattern + noise)
+        values = consumption[:35040]
+        
+        # Scale to target annual (default 10,000 kWh/year)
+        if annual_value is None:
+            annual_value = 10000
+        
+        current_annual = values.sum()
+        values = values * (annual_value / current_annual)
+    
+    # Convert to text with comma as decimal separator
+    lines = []
+    for value in values:
+        # Format with comma as decimal separator
+        formatted_value = f"{value:.6f}".replace('.', ',')
+        lines.append(formatted_value)
+    
+    return '\n'.join(lines)
+
+
 # ==============================================================================
-# SECTION 2: STREAMLIT UI - OPTIMIZED VERSION
+# SECTION 2: STREAMLIT UI - VERSION 3.0 WITH TXT SUPPORT
 # ==============================================================================
 
 def build_ui():
-    """Streamlit UI with PV file upload option."""
+    """Streamlit UI with TXT file support."""
     st.set_page_config(
-        page_title="PV & BESS Optimizer v2",
+        page_title="PV & BESS Optimizer v3",
         page_icon="⚡",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -644,18 +777,26 @@ def build_ui():
             color: #666;
             margin-top: 10px;
         }
+        .highlight-box {
+            background-color: #e3f2fd;
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 4px solid #2196F3;
+            margin: 10px 0;
+        }
         </style>
     """, unsafe_allow_html=True)
     
-    st.title("⚡ PV & BESS Optimizer v2.0")
+    st.title("⚡ PV & BESS Optimizer v3.0")
     st.markdown("""
-        ### Optimized Solar + Battery Sizing Calculator
+        ### Optimized Solar + Battery Sizing Calculator with TXT Support
         Find the perfect PV and battery system configuration based on your consumption profile and PV production data.
         
         **🎯 Key Features:**
-        - Upload your own PV production data (1 kWp baseline)
-        - Optimizes for maximum NPV over 10 years
-        - 5-year detailed simulation with degradation modeling
+        - **NEW:** TXT file format for improved accuracy
+        - 5-year simulation with 15-minute resolution (35,040 intervals/year)
+        - Excel-like calculation approach with columnar data structure
+        - Automatic handling of European decimal format (comma separator)
     """)
     
     # Sidebar configuration
@@ -683,245 +824,133 @@ def build_ui():
         )
         
         # PV Production Data
-        st.subheader("2. PV Production Data")
+        st.subheader("2. PV Production Data (TXT)")
         st.markdown("""
-            📁 **Upload PV production baseline (1 kWp)**
-            - 35,040 rows (15-min intervals)
-            - Values in **kW** (instantaneous power) or **kWh** (energy per interval)
-            - ✅ Auto-detects format based on values
-            - ✅ Supports comma (1,234) or dot (1.234) decimals
-        """)
+            <div class="highlight-box">
+            <b>📁 Upload PV production baseline (1 kWp)</b><br>
+            • 35,040 lines (one value per line)<br>
+            • Values in <b>kWh per 15-min interval</b><br>
+            • Comma (,) as decimal separator<br>
+            • Expected annual: 800-1800 kWh/kWp
+            </div>
+        """, unsafe_allow_html=True)
         
         pv_file = st.file_uploader(
-            "Upload PV production data (CSV)",
-            type="csv",
-            help="CSV with 35,040 rows of PV production for 1 kWp",
+            "Upload PV production data (TXT)",
+            type="txt",
+            help="TXT with 35,040 values for 1 kWp system",
             key="pv_upload"
         )
         
         # Show sample PV data format
         with st.expander("📋 View Sample PV Data Format"):
             st.code("""
-pv_production
-0.000
-0.000
-0.000
-0.125
-0.285
-0.412
+0,000000
+0,000000
+0,000000
+0,031250
+0,071250
+0,103000
 ...
-(35,040 rows total)
+(35,040 lines total)
             """)
             
             st.info("""
-            💡 **PV Data Format Options:**
+            💡 **PV Data Requirements:**
             
-            **1. Power Values (kW)** - Instantaneous power
-            - Range: 0 to ~1 kW for 1 kWp system
-            - Example: 0.850 = 850 W instantaneous power
+            - **Format:** One value per line, comma as decimal separator
+            - **Unit:** kWh per 15-minute interval
+            - **System size:** Data for 1 kWp reference system
+            - **Typical values:** 0 to ~0,25 kWh per interval
+            - **Annual total:** 800-1800 kWh for 1 kWp
             
-            **2. Energy Values (kWh)** - Energy per 15-min interval
-            - Range: 0 to ~0.25 kWh for 1 kWp system  
-            - Example: 0.212 = 212 Wh in 15 minutes
-            
-            The system **automatically detects** which format you're using based on the maximum values!
-            
-            **CSV Format Support:**
-            - European: Semicolon separator with comma decimal (0,850)
-            - International: Comma separator with dot decimal (0.850)
+            The system will scale these values by the optimized PV size (kWp).
             """)
             
-            if st.button("📊 Generate Sample PV Data"):
-                # Generate realistic PV profile for 1 kWp
-                hours = np.arange(0, 8760, 0.25)  # 15-min intervals
-                
-                # Solar profile: zero at night, bell curve during day
-                daily_pattern = np.zeros(96)  # 96 intervals per day
-                sunrise = 24  # 6 AM
-                sunset = 72   # 6 PM
-                peak = 48     # 12 PM
-                
-                for i in range(sunrise, sunset):
-                    angle = (i - sunrise) * np.pi / (sunset - sunrise)
-                    daily_pattern[i] = 0.85 * np.sin(angle) ** 1.5  # Peak at 0.85 kW for 1 kWp
-                
-                # Add seasonal variation
-                pv_production = []
-                for day in range(365):
-                    seasonal_factor = 0.7 + 0.3 * np.cos((day - 172) * 2 * np.pi / 365)  # Peak in summer
-                    daily_production = daily_pattern * seasonal_factor
-                    
-                    # Add some random variation
-                    daily_production *= (0.9 + 0.2 * np.random.random())
-                    
-                    pv_production.extend(daily_production)
-                
-                pv_sample_df = pd.DataFrame({
-                    'pv_production_kw': pv_production[:35040]  # Ensure exactly 35040 rows
-                })
-                
-                # Let user choose format
-                data_format = st.radio(
-                    "Choose data format:",
-                    ["kW (instantaneous power)", "kWh (energy per 15-min interval)"],
-                    key="pv_data_format_choice"
-                )
-                
-                csv_format = st.radio(
-                    "Choose CSV format:",
-                    ["International (comma separator, dot decimal)", 
-                     "European (semicolon separator, comma decimal)"],
-                    key="pv_csv_format_choice"
-                )
-                
-                # Adjust values based on format choice
-                if data_format == "kWh (energy per 15-min interval)":
-                    # Convert kW to kWh (multiply by 0.25 hours)
-                    pv_sample_df['pv_production'] = pv_sample_df['pv_production_kw'] * 0.25
-                    column_name = 'pv_production_kwh'
-                else:
-                    pv_sample_df['pv_production'] = pv_sample_df['pv_production_kw']
-                    column_name = 'pv_production_kw'
-                
-                # Create final dataframe with appropriate column name
-                final_df = pd.DataFrame({
-                    column_name: pv_sample_df['pv_production']
-                })
-                
-                if csv_format == "European (semicolon separator, comma decimal)":
-                    # Convert to European format
-                    csv = final_df.to_csv(index=False, sep=';', decimal=',')
-                    file_name = f"sample_pv_1kwp_{data_format[:3]}_EU.csv"
-                else:
-                    # Standard format
-                    csv = final_df.to_csv(index=False)
-                    file_name = f"sample_pv_1kwp_{data_format[:3]}.csv"
-                
-                st.download_button(
-                    label=f"📥 Download Sample PV (1 kWp) - {data_format[:3]} format",
-                    data=csv,
-                    file_name=file_name,
-                    mime="text/csv",
-                    key="download_pv_sample"
-                )
+            if st.button("📊 Generate Sample PV Data (1 kWp)"):
+                # Generate sample PV data
+                pv_content = generate_sample_txt_file('pv', annual_value=1373)
                 
                 # Show preview
-                st.write("**Preview (first day):**")
-                fig_data = pd.DataFrame({
-                    'Hour': np.arange(0, 24, 0.25),
-                    f'PV ({data_format[:3]})': final_df.iloc[:96].values.flatten()
-                })
-                st.line_chart(fig_data.set_index('Hour'))
+                st.write("**Preview (first 10 lines):**")
+                preview_lines = pv_content.split('\n')[:10]
+                st.code('\n'.join(preview_lines))
                 
-                # Show annual production
-                if data_format == "kWh (energy per 15-min interval)":
-                    annual_prod = final_df.sum().values[0]
-                else:
-                    annual_prod = final_df.sum().values[0] * 0.25
+                # Calculate annual
+                values = [float(line.replace(',', '.')) for line in pv_content.split('\n')]
+                annual_prod = sum(values)
+                st.success(f"Annual production: {annual_prod:.0f} kWh/kWp")
                 
-                st.info(f"Annual production (1 kWp): {annual_prod:.0f} kWh")
+                st.download_button(
+                    label="📥 Download Sample PV Data (TXT)",
+                    data=pv_content,
+                    file_name="pv_production_1kwp.txt",
+                    mime="text/plain",
+                    key="download_pv_sample"
+                )
         
         # Consumption Profile
-        st.subheader("3. Consumption Profile")
+        st.subheader("3. Consumption Profile (TXT)")
         st.markdown("""
-            📁 **Upload consumption data**
-            - Column named 'consumption_kWh'
-            - 35,040 rows (15-min intervals)
-            - ✅ Supports both comma (1,234) and dot (1.234) as decimal separator
-        """)
+            <div class="highlight-box">
+            <b>📁 Upload consumption data</b><br>
+            • 35,040 lines (one value per line)<br>
+            • Values in <b>kWh per 15-min interval</b><br>
+            • Comma (,) as decimal separator<br>
+            • Repeated for 5 years in simulation
+            </div>
+        """, unsafe_allow_html=True)
         
         consumption_file = st.file_uploader(
-            "Upload consumption data (CSV)",
-            type="csv",
-            help="CSV with 'consumption_kWh' column and 35,040 rows",
+            "Upload consumption data (TXT)",
+            type="txt",
+            help="TXT with 35,040 consumption values",
             key="consumption_upload"
         )
         
         # Sample consumption data generator
         with st.expander("📋 Generate Sample Consumption Data"):
             st.code("""
-consumption_kWh
-0.125
-0.130
-0.128
+0,125000
+0,130000
+0,128000
+0,135000
 ...
-(35,040 rows total)
+(35,040 lines total)
             """)
             
-            st.info("""
-            💡 **Supported CSV Formats:**
-            
-            **Option 1 - Semicolon separator with comma decimal (European):**
-            ```
-            consumption_kWh
-            0,125
-            0,130
-            1,234
-            ```
-            
-            **Option 2 - Comma separator with dot decimal (International):**
-            ```
-            consumption_kWh
-            0.125
-            0.130
-            1.234
-            ```
-            """)
+            annual_target = st.number_input(
+                "Target annual consumption (kWh)",
+                min_value=1000,
+                max_value=100000,
+                value=10000,
+                step=1000,
+                key="consumption_target"
+            )
             
             if st.button("📊 Generate Sample Consumption Data"):
-                # Generate realistic consumption profile
-                hours = np.arange(0, 8760, 0.25)  # 15-min intervals for a year
-                
-                # Base load + daily pattern + seasonal variation + noise
-                base_load = 0.3
-                daily_pattern = 0.4 * np.sin((hours % 24 - 6) * np.pi / 12) ** 2
-                seasonal_pattern = 0.2 * np.cos((hours / 8760) * 2 * np.pi)
-                noise = np.random.normal(0, 0.05, len(hours))
-                
-                consumption = np.maximum(0, base_load + daily_pattern + seasonal_pattern + noise)
-                
-                sample_df = pd.DataFrame({
-                    'consumption_kWh': consumption[:35040]  # Ensure exactly 35040 rows
-                })
-                
-                # Scale to realistic annual consumption (e.g., 10,000 kWh/year)
-                current_annual = sample_df['consumption_kWh'].sum()
-                target_annual = 10000  # kWh
-                sample_df['consumption_kWh'] = sample_df['consumption_kWh'] * (target_annual / current_annual)
-                
-                # Let user choose format
-                format_choice = st.radio(
-                    "Choose CSV format:",
-                    ["International (comma separator, dot decimal)", 
-                     "European (semicolon separator, comma decimal)"],
-                    key="cons_format_choice"
-                )
-                
-                if format_choice == "European (semicolon separator, comma decimal)":
-                    # Convert to European format
-                    csv = sample_df.to_csv(index=False, sep=';', decimal=',')
-                    file_name = "sample_consumption_data_EU.csv"
-                else:
-                    # Standard format
-                    csv = sample_df.to_csv(index=False)
-                    file_name = "sample_consumption_data.csv"
-                
-                st.download_button(
-                    label=f"📥 Download Sample Consumption Data - {format_choice.split(' ')[0]} Format",
-                    data=csv,
-                    file_name=file_name,
-                    mime="text/csv",
-                    key="download_consumption_sample"
-                )
+                # Generate sample consumption data
+                cons_content = generate_sample_txt_file('consumption', annual_value=annual_target)
                 
                 # Show preview
-                st.write("**Preview (first day):**")
-                fig_data = pd.DataFrame({
-                    'Hour': np.arange(0, 24, 0.25),
-                    'Consumption (kWh)': sample_df['consumption_kWh'].iloc[:96].values
-                })
-                st.line_chart(fig_data.set_index('Hour'))
-                st.info(f"Annual consumption: {sample_df['consumption_kWh'].sum():.0f} kWh")
+                st.write("**Preview (first 10 lines):**")
+                preview_lines = cons_content.split('\n')[:10]
+                st.code('\n'.join(preview_lines))
+                
+                # Calculate stats
+                values = [float(line.replace(',', '.')) for line in cons_content.split('\n')]
+                annual_cons = sum(values)
+                peak_load = max(values) * 4  # Convert to kW
+                
+                st.success(f"Annual consumption: {annual_cons:.0f} kWh | Peak load: {peak_load:.1f} kW")
+                
+                st.download_button(
+                    label="📥 Download Sample Consumption Data (TXT)",
+                    data=cons_content,
+                    file_name=f"consumption_{int(annual_target)}kwh.txt",
+                    mime="text/plain",
+                    key="download_consumption_sample"
+                )
         
         # Advanced settings
         with st.expander("⚙️ Advanced Settings"):
@@ -958,203 +987,87 @@ consumption_kWh
     # Main content area
     if pv_file is not None and consumption_file is not None:
         try:
-            # Load and validate PV data
-            # Try different separators to handle various CSV formats
-            try:
-                # First try with semicolon separator (common in European CSVs)
-                pv_df = pd.read_csv(pv_file, sep=';', decimal=',')
-            except:
-                try:
-                    # Then try with comma separator and dot decimal
-                    pv_file.seek(0)  # Reset file pointer
-                    pv_df = pd.read_csv(pv_file, sep=',', decimal='.')
-                except:
-                    # Finally try tab separator
-                    pv_file.seek(0)  # Reset file pointer
-                    pv_df = pd.read_csv(pv_file, sep='\t', decimal=',')
+            # Load PV data from TXT
+            is_valid_pv, message_pv, pv_data = load_txt_file(pv_file, expected_rows=35040)
             
-            is_valid, message, pv_baseline = validate_pv_data(pv_df)
-            
-            if not is_valid:
-                st.error(f"❌ PV data error: {message}")
+            if not is_valid_pv:
+                st.error(f"❌ PV data error: {message_pv}")
                 return
-            else:
-                # Show success with format info
-                format_type = "kWh per interval" if pv_baseline.attrs.get('is_kwh_format', False) else "kW instantaneous"
-                annual_prod = pv_baseline.attrs.get('annual_production', 0)
-                st.success(f"""
-                    ✅ PV data loaded successfully!
-                    - Format detected: **{format_type}**
-                    - Annual production: **{annual_prod:.0f} kWh/kWp**
-                    - {message}
-                """)
+            
+            # Validate PV data
+            is_valid_pv, message_pv, pv_metadata = validate_pv_txt_data(pv_data)
+            
+            if not is_valid_pv:
+                st.error(f"❌ PV validation error: {message_pv}")
+                return
+            
+            st.success(f"✅ PV data loaded: {message_pv}")
+            
+            # Show PV statistics
+            with st.expander("📊 PV Production Statistics (1 kWp baseline)"):
+                col1, col2, col3, col4 = st.columns(4)
                 
-                # Show PV data statistics
-                with st.expander("📊 PV Production Statistics (1 kWp baseline)"):
-                    col1, col2, col3, col4 = st.columns(4)
-                    
-                    # Get format info
-                    is_kwh_format = pv_baseline.attrs.get('is_kwh_format', False)
-                    annual_pv = pv_baseline.attrs.get('annual_production', 0)
-                    
-                    if is_kwh_format:
-                        peak_power = pv_baseline['pv_production_kwp'].max() * 4  # Convert to kW
-                        st.write(f"**Data format detected:** kWh per 15-min interval")
-                    else:
-                        peak_power = pv_baseline['pv_production_kwp'].max()
-                        st.write(f"**Data format detected:** kW instantaneous power")
-                    
-                    capacity_factor = annual_pv / (1 * 8760) * 100  # 1 kWp * hours in year
-                    
-                    with col1:
-                        st.metric("Annual Production", f"{annual_pv:.0f} kWh/kWp")
-                    with col2:
-                        st.metric("Peak Power", f"{peak_power:.3f} kW")
-                    with col3:
-                        st.metric("Capacity Factor", f"{capacity_factor:.1f}%")
-                    with col4:
-                        daylight_hours = (pv_baseline['pv_production_kwp'] > 0).sum() / 4
-                        st.metric("Daylight Hours", f"{daylight_hours:.0f}")
-                    
-                    # Show data format verification
-                    st.write("**Data Format Verification (first 5 values):**")
-                    first_values = pv_baseline['pv_production_kwp'].head()
-                    verification_df = pd.DataFrame({
-                        'Index': range(len(first_values)),
-                        'Raw Value': first_values.values,
-                        'Unit': ['kWh/15min' if is_kwh_format else 'kW'] * len(first_values)
-                    })
-                    st.dataframe(verification_df, use_container_width=False)
-                    
-                    # Show daily profile
-                    st.write("**Average Daily Profile (1 kWp):**")
-                    hourly_avg = []
-                    for h in range(24):
-                        hour_data = pv_baseline.iloc[h*4:(h+1)*4]['pv_production_kwp']
-                        if is_kwh_format:
-                            # Sum kWh values for the hour
-                            hourly_avg.append(hour_data.sum())
-                        else:
-                            # Average kW values for the hour
-                            hourly_avg.append(hour_data.mean())
-                    
-                    profile_df = pd.DataFrame({
-                        'Hour': range(24),
-                        'Value': hourly_avg
-                    })
-                    
-                    if is_kwh_format:
-                        st.write("Hourly energy (kWh):")
-                    else:
-                        st.write("Average hourly power (kW):")
-                    
-                    st.line_chart(profile_df.set_index('Hour')['Value'])
+                with col1:
+                    st.metric("Annual Production", f"{pv_metadata['annual_production']:.0f} kWh/kWp")
+                with col2:
+                    st.metric("Peak Value", f"{pv_metadata['peak_value']:.3f} kWh/interval")
+                with col3:
+                    st.metric("Capacity Factor", f"{pv_metadata['capacity_factor']:.1f}%")
+                with col4:
+                    st.metric("Daylight Hours", f"{pv_metadata['daylight_hours']:.0f}")
+                
+                # Show daily profile
+                st.write("**Average Daily Profile (1 kWp):**")
+                hourly_values = []
+                for h in range(24):
+                    hour_data = pv_data[h*4:(h+1)*4]
+                    hourly_values.append(hour_data.sum())  # Sum kWh for the hour
+                
+                profile_df = pd.DataFrame({
+                    'Hour': range(24),
+                    'Energy (kWh)': hourly_values
+                })
+                
+                st.line_chart(profile_df.set_index('Hour')['Energy (kWh)'])
             
-            # Load consumption data
-            # Try different separators to handle various CSV formats
-            try:
-                # First try with semicolon separator (common in European CSVs)
-                consumption_df = pd.read_csv(consumption_file, sep=';', decimal=',')
-            except:
-                try:
-                    # Then try with comma separator and dot decimal
-                    consumption_file.seek(0)  # Reset file pointer
-                    consumption_df = pd.read_csv(consumption_file, sep=',', decimal='.')
-                except:
-                    # Finally try tab separator
-                    consumption_file.seek(0)  # Reset file pointer
-                    consumption_df = pd.read_csv(consumption_file, sep='\t', decimal=',')
+            # Load consumption data from TXT
+            is_valid_cons, message_cons, consumption_data = load_txt_file(consumption_file, expected_rows=35040)
             
-            if 'consumption_kWh' not in consumption_df.columns:
-                st.error("❌ Consumption CSV must contain 'consumption_kWh' column")
+            if not is_valid_cons:
+                st.error(f"❌ Consumption data error: {message_cons}")
                 return
             
-            # Handle comma as decimal separator in consumption data only if needed
-            if not pd.api.types.is_numeric_dtype(consumption_df['consumption_kWh']):
-                # Data is not numeric, need to convert
-                consumption_df['consumption_kWh'] = consumption_df['consumption_kWh'].astype(str).str.replace(',', '.', regex=False)
-                try:
-                    consumption_df['consumption_kWh'] = pd.to_numeric(consumption_df['consumption_kWh'], errors='coerce')
-                    
-                    # Check for conversion errors
-                    n_errors = consumption_df['consumption_kWh'].isna().sum()
-                    if n_errors > 0:
-                        st.warning(f"⚠️ Found {n_errors} values that couldn't be converted to numbers. They will be treated as 0.")
-                        consumption_df['consumption_kWh'] = consumption_df['consumption_kWh'].fillna(0)
-                except Exception as e:
-                    st.error(f"❌ Error converting consumption values: {str(e)}")
-                    return
+            # Validate consumption data
+            is_valid_cons, message_cons, cons_metadata = validate_consumption_txt_data(consumption_data)
             
-            # Validate and adjust consumption data length
-            expected_rows = 35040
-            if len(consumption_df) != expected_rows:
-                st.warning(f"⚠️ Adjusting consumption data from {len(consumption_df):,} to {expected_rows:,} rows")
-                if len(consumption_df) > expected_rows:
-                    consumption_df = consumption_df.iloc[:expected_rows].copy()
-                else:
-                    # Repeat pattern to fill
-                    repeats = (expected_rows // len(consumption_df)) + 1
-                    consumption_df = pd.concat([consumption_df] * repeats).iloc[:expected_rows].reset_index(drop=True)
+            if not is_valid_cons:
+                st.error(f"❌ Consumption validation error: {message_cons}")
+                return
             
-            # Validate consumption data is reasonable
-            annual_consumption = consumption_df['consumption_kWh'].sum()
-            if annual_consumption > 100000:  # More than 100 MWh/year
-                st.warning(f"""
-                    ⚠️ **Very high consumption detected:** {annual_consumption:,.0f} kWh/year
-                    
-                    This seems like industrial consumption. Typical values:
-                    - Residential: 3,000-10,000 kWh/year
-                    - Small business: 10,000-50,000 kWh/year
-                    - Large business: 50,000-500,000 kWh/year
-                    
-                    Please verify your data units are correct (kWh per 15-min interval).
-                """)
-            
-            # Check for unrealistic peak values
-            peak_power = consumption_df['consumption_kWh'].max() * 4  # Convert to kW
-            if peak_power > 100:  # More than 100 kW peak
-                st.warning(f"""
-                    ⚠️ **Very high peak power:** {peak_power:.1f} kW
-                    
-                    Typical peak power:
-                    - Residential: 3-10 kW
-                    - Small business: 10-50 kW
-                    
-                    Your data might be in Wh instead of kWh.
-                """)
+            st.success(f"✅ Consumption data loaded: {message_cons}")
             
             # Display consumption statistics
             st.subheader("📊 Consumption Profile Summary")
             col1, col2, col3, col4 = st.columns(4)
             
-            total_annual = consumption_df['consumption_kWh'].sum()
             with col1:
-                st.metric("Annual Consumption", f"{total_annual:,.0f} kWh")
+                st.metric("Annual Consumption", f"{cons_metadata['annual_consumption']:,.0f} kWh")
             with col2:
-                st.metric("Average Daily", f"{total_annual/365:,.1f} kWh")
+                st.metric("Average Daily", f"{cons_metadata['daily_average']:,.1f} kWh")
             with col3:
-                st.metric("Peak Load", f"{consumption_df['consumption_kWh'].max()*4:,.1f} kW")
+                st.metric("Peak Load", f"{cons_metadata['peak_load_kw']:,.1f} kW")
             with col4:
-                st.metric("Base Load", f"{consumption_df['consumption_kWh'].min()*4:,.1f} kW")
+                st.metric("Base Load", f"{cons_metadata['base_load_kw']:,.1f} kW")
             
         except Exception as e:
             st.error(f"""
                 ❌ Error reading files: {str(e)}
                 
-                **Common causes:**
-                1. CSV uses semicolon (;) as separator → The system now handles this automatically
-                2. Numbers use comma as decimal separator → The system converts this automatically
-                3. Extra columns or spaces in the data → Check line 34 of your file
-                4. Special characters or formatting issues
-                
-                **Please check your CSV file format:**
-                - Should have only 1 column with header
-                - 35,040 data rows (no empty rows)
-                - No extra separators or columns
-                
-                **Supported formats:**
-                - Semicolon separator with comma decimal: `1,234;` ✅
-                - Comma separator with dot decimal: `1.234,` ✅
+                **Please check your TXT file format:**
+                - One value per line
+                - Comma (,) as decimal separator
+                - Exactly 35,040 lines
+                - No empty lines or headers
             """)
             return
         
@@ -1173,8 +1086,7 @@ consumption_kWh
             # Prepare inputs
             user_inputs = {
                 "budget": budget,
-                "available_area_m2": available_area_m2,
-                "consumption_profile_df": consumption_df
+                "available_area_m2": available_area_m2
             }
             
             config = {
@@ -1209,8 +1121,10 @@ consumption_kWh
                     total_capex = capex_pv + capex_bess
                     
                     if total_capex <= budget and pv_kwp <= available_area_m2 / 5.0:
-                        result = run_simulation_vectorized(pv_kwp, bess_kwh, pv_baseline, 
-                                                         consumption_df, config)
+                        result = run_simulation_vectorized_v3(
+                            pv_kwp, bess_kwh, pv_data, consumption_data, 
+                            config, export_details=export_daily_data
+                        )
                         
                         results.append({
                             'Configuration': f"{pv_kwp} kWp / {bess_kwh} kWh",
@@ -1227,7 +1141,9 @@ consumption_kWh
             else:
                 # Full optimization
                 with st.spinner('🔄 Running optimization...'):
-                    optimal_system = find_optimal_system(user_inputs, config, pv_baseline, enable_debug)
+                    optimal_system = find_optimal_system_v3(
+                        user_inputs, config, pv_data, consumption_data, enable_debug
+                    )
                     
                     if optimal_system:
                         # Save to session state
@@ -1358,36 +1274,37 @@ Parameters Used:
     else:
         # Instructions
         st.info("""
-            📁 **Please upload both files to begin:**
+            📁 **Please upload both TXT files to begin:**
             
-            1. **PV Production Data** (CSV)
-               - 35,040 rows of 15-minute intervals
-               - Values for 1 kWp reference system
-               - **Accepts both formats:**
-                 - **kW** (instantaneous power): typical range 0-1 kW
-                 - **kWh** (energy per 15-min): typical range 0-0.25 kWh
-               - Auto-detects format based on value ranges
-               - Single column with header
+            1. **PV Production Data** (TXT)
+               - 35,040 lines (one value per line)
+               - Values in kWh per 15-minute interval
+               - Data for 1 kWp reference system
+               - Comma (,) as decimal separator
+               - Expected annual: 800-1800 kWh/kWp
                
-            2. **Consumption Data** (CSV)
-               - Column named 'consumption_kWh'
-               - 35,040 rows of 15-minute intervals
-               - Values in kWh per interval
+            2. **Consumption Data** (TXT)
+               - 35,040 lines (one value per line)
+               - Values in kWh per 15-minute interval
+               - Comma (,) as decimal separator
+               - Will be repeated for 5-year simulation
                
-            ✅ **Supported CSV Formats:**
-            - **European**: Semicolon separator (;) with comma decimal (1,234)
-            - **International**: Comma separator (,) with dot decimal (1.234)
+            **💡 TXT Format Example:**
+            ```
+            0,125000
+            0,130500
+            0,128750
+            ...
+            ```
             
-            The system automatically detects your format!
-            
-            ⚠️ **Important**: Each file should have only ONE column with data.
         """)
     
     # Footer
     st.markdown("---")
     st.markdown("""
         <div style='text-align: center; color: #888;'>
-            <p>PV & BESS Optimizer v2.0 - Optimized Version</p>
+            <p>PV & BESS Optimizer v3.0 - TXT File Support</p>
+            <p>Optimized for accuracy with European decimal format</p>
             <p>Made with ❤️ using Streamlit</p>
         </div>
     """, unsafe_allow_html=True)
