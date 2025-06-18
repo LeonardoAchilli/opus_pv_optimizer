@@ -6,6 +6,15 @@ import io
 import zipfile
 from typing import Dict, Tuple, Optional, List
 
+# --- Hot-patch critical components ---------------------------
+from app_stable_v2_1_patch import (
+    validate_pv_data,
+    run_simulation_vectorized,
+    find_optimal_system,
+    export_detailed_calculations,
+)
+# --------------------------------------------------------------
+
 # ==============================================================================
 # SECTION 1: BACKEND LOGIC - OPTIMIZED VERSION
 # ==============================================================================
