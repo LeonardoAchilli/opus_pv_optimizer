@@ -1,4 +1,3 @@
-from __future__ import annotations
 import json
 import numpy as np
 import pandas as pd
@@ -7,365 +6,587 @@ import io
 import zipfile
 from typing import Dict, Tuple, Optional, List
 
-import numpy as np
-import pandas as pd
-from typing import Dict, Tuple, Optional, List
-
-# Streamlit is only required for optional UI hooks; import guarded
-try:
-    import streamlit as st
-except ModuleNotFoundError:  # pragma: no cover – pure backend usage
-    class _Stub:
-        def __getattr__(self, name):
-            return lambda *_, **__: None
-    st = _Stub()  # type: ignore
-
 # ==============================================================================
 # SECTION 1: BACKEND LOGIC - OPTIMIZED VERSION
 # ==============================================================================
 
 def validate_pv_data(pv_df: pd.DataFrame) -> Tuple[bool, str, Optional[pd.DataFrame]]:
-    """Return *(is_valid, message, clean_df)* for an uploaded 1‑kWp baseline.
-
-    Improvements v2.1
-    -----------------
-    • **Universal coercion** – handles commas/dots, stray spaces, missing cells.
-    • **Post‑resample check** – re‑runs all sanity gates after hourly → 15‑min up‑sampling.
-    • **Tighter plausibility window** – annual yield must land in *[700, 1 700] kWh/kWp*.
     """
-
-    # ---- 0. Quick emptiness / column sanity ---------------------------------
-    if pv_df.empty or len(pv_df.columns) == 0:
-        return False, "File contains no data", None
-
-    col = pv_df.columns[0]
-    # Coerce to string, normalise decimal marks, strip white‑space
-    s = (
-        pv_df[col]
-        .astype(str)
-        .str.strip()
-        .str.replace("\u202f", "")  # non‑breaking space often used as thousands sep
-        .str.replace(",", ".", regex=False)
-    )
-    # to_numeric with *coerce* – we will count errors below
-    numeric = pd.to_numeric(s, errors="coerce")
-    n_bad = numeric.isna().sum()
-    if n_bad:
-        return False, f"{n_bad} non‑numeric values found; please clean file", None
-
-    clean_df = pd.DataFrame({"pv_production_kwp": numeric})
-
-    EXPECTED = 35_040  # 15‑min for full year
-    rows = len(clean_df)
-
-    if rows != EXPECTED:
-        if rows == 8_760:  # hourly – upscale by repeating each row 4×
-            clean_df = clean_df.iloc[np.repeat(np.arange(rows), 4)].reset_index(drop=True)
-            rows = EXPECTED
+    Validate PV production data from uploaded CSV.
+    Handles both comma and dot as decimal separator.
+    
+    Returns:
+        Tuple of (is_valid, error_message, processed_dataframe)
+    """
+    # Check if dataframe has any columns
+    if pv_df.empty:
+        return False, "File is empty", None
+    
+    # Get the first column regardless of name
+    if len(pv_df.columns) == 0:
+        return False, "No columns found in CSV", None
+    
+    # Use the first column as PV production data
+    pv_column = pv_df.columns[0]
+    
+    # Check if we need to convert values
+    # If the column is already numeric, no conversion needed
+    if pd.api.types.is_numeric_dtype(pv_df[pv_column]):
+        clean_df = pd.DataFrame({
+            'pv_production_kwp': pv_df[pv_column]
+        })
+    else:
+        # Column contains strings, need to convert
+        # Replace comma with dot for decimal separator
+        pv_df[pv_column] = pv_df[pv_column].astype(str).str.replace(',', '.', regex=False)
+        
+        # Create a clean dataframe with standardized column name
+        try:
+            clean_df = pd.DataFrame({
+                'pv_production_kwp': pd.to_numeric(pv_df[pv_column], errors='coerce')
+            })
+        except Exception as e:
+            return False, f"Error converting values to numbers: {str(e)}", None
+        
+        # Check for conversion errors
+        if clean_df['pv_production_kwp'].isna().sum() > 0:
+            n_errors = clean_df['pv_production_kwp'].isna().sum()
+            return False, f"Found {n_errors} values that couldn't be converted to numbers", None
+    
+    # Check number of rows
+    expected_rows = 35040
+    actual_rows = len(clean_df)
+    
+    if actual_rows != expected_rows:
+        # Try to handle common cases
+        if actual_rows == 8760:  # Hourly data
+            # Resample to 15-minute intervals
+            clean_df = clean_df.iloc[np.repeat(np.arange(len(clean_df)), 4)].reset_index(drop=True)
+            clean_df = clean_df.iloc[:expected_rows]  # Ensure exact length
+            return True, f"Converted hourly data to 15-min intervals", clean_df
         else:
-            return False, f"Expected {EXPECTED:,} rows (15‑min), found {rows:,}", None
+            return False, f"Expected {expected_rows:,} rows (15-min intervals for 1 year), found {actual_rows:,}", None
+    
+    # Validate data range
+    if clean_df['pv_production_kwp'].min() < 0:
+        return False, "Negative values found in PV production data", None
+    
+    # Determine if values are in kW or kWh based on typical ranges
+    max_value = clean_df['pv_production_kwp'].max()
+    sum_value = clean_df['pv_production_kwp'].sum()
+    
+    # If max value is < 0.5, likely kWh per interval; if > 0.5, likely kW
+    if max_value < 0.5:
+        # Values appear to be in kWh per 15-min interval
+        annual_production = sum_value  # Already in kWh
+        st.info(f"📊 Detected format: kWh per 15-min interval (max value: {max_value:.3f})")
+    else:
+        # Values appear to be in kW
+        annual_production = sum_value * 0.25  # Convert to kWh
+        st.info(f"📊 Detected format: kW instantaneous power (max value: {max_value:.3f})")
+    
+    # Check if all values are zero
+    if sum_value == 0:
+        return False, "All PV production values are zero", None
+    
+    # Check if annual production is reasonable
+    if annual_production < 500:  # Less than 500 kWh/kWp/year is too low
+        return False, f"Annual production too low: {annual_production:.0f} kWh/kWp. Expected 800-1500 kWh/kWp for Europe", None
+    
+    if annual_production > 2000:  # More than 2000 kWh/kWp/year is too high
+        return False, f"Annual production too high: {annual_production:.0f} kWh/kWp. Expected 800-1500 kWh/kWp for Europe", None
+    
+    # Store the detected format in the dataframe attributes for later use
+    clean_df.attrs['is_kwh_format'] = (max_value < 0.5)
+    clean_df.attrs['annual_production'] = annual_production
+    
+    return True, f"Valid PV data - Annual production: {annual_production:.0f} kWh/kWp", clean_df
 
-    # Annual‑yield plausibility -------------------------------------------------
-    max_val = clean_df["pv_production_kwp"].max()
-    is_kwh_format = max_val < 0.5
-    annual_kwh = (
-        clean_df["pv_production_kwp"].sum() if is_kwh_format else clean_df["pv_production_kwp"].sum() * 0.25
-    )
 
-    if not (700 <= annual_kwh <= 1_700):
-        return (
-            False,
-            f"Annual production {annual_kwh:.0f} kWh/kWp outside expected 700‑1 700 range",
-            None,
-        )
-
-    # Attach metadata for downstream logic
-    clean_df.attrs.update(is_kwh_format=is_kwh_format, annual_production=annual_kwh)
-
-    msg_fmt = "kWh per 15‑min" if is_kwh_format else "kW instantaneous"
-    return True, f"Valid PV data ({msg_fmt}); annual yield ≈ {annual_kwh:.0f} kWh/kWp", clean_df
-
-# -----------------------------------------------------------------------------
-# 2. Vectorised energy‑flow engine
-# -----------------------------------------------------------------------------
-
-def run_simulation_vectorized(
-    pv_kwp: float,
-    bess_kwh_nominal: float,
-    pv_production_baseline: pd.DataFrame,
-    consumption_profile: pd.DataFrame,
-    config: Dict,
-    export_details: bool = False,
-    debug: bool = False,
-) -> Dict:
-    """Five‑year simulation with quarter‑hour resolution (≈175 k steps).
-
-    Key v2.1 fixes
-    --------------
-    • **Single‑pass NumPy loop** with *energy_step* helper – prevents negative SoC.
-    • Enforces C‑rate *per step* and never charges above usable capacity.
-    • Grid import/export sign‑correct and limited by physical surplus/deficit.
+def run_simulation_vectorized(pv_kwp: float, bess_kwh_nominal: float, pv_production_baseline: pd.DataFrame, 
+                            consumption_profile: pd.DataFrame, config: Dict, 
+                            export_details: bool = False, debug: bool = False) -> Dict:
     """
-
-    # -------------------------- constants & helpers ---------------------------
-    DOD = config["bess_dod"]
-    C_RATE = config["bess_c_rate"]
-    ETA = config["bess_efficiency"]
-    KWH_NET = bess_kwh_nominal * DOD  # usable capacity
-    STEP_MAX = bess_kwh_nominal * C_RATE / 4  # kWh per 15‑min at C‑rate
-
-    pv_base = pv_production_baseline["pv_production_kwp"].to_numpy(np.float32)
-    cons = consumption_profile["consumption_kWh"].to_numpy(np.float32)
-    is_kwh = pv_production_baseline.attrs.get("is_kwh_format", False)
-
-    # Pre‑compute 5‑year degradation factors for PV
-    degr = 1 - np.arange(5, dtype=np.float32) * config["pv_degradation_rate"]
-
-    STEPS_YEAR = 35_040
-    soc_out: List[np.ndarray] = []  # store yearly SoC for SOH calc
-
-    annual_metrics: List[Dict] = []
-    cash_flows: List[float] = []
-
-    pv_to_kwh = (lambda arr, kwp, factor: arr * kwp * factor) if is_kwh else (
-        lambda arr, kwp, factor: arr * kwp * factor * 0.25
-    )
-
-    # @njit could be used here for 4× speed‑up; left pure Python for readability.
-    def energy_step(prod: float, load: float, soc: float, soh_cap: float):
-        """Return tuple *(soc_new, charge_kWh, discharge_kWh, export_kWh, import_kWh)*"""
-
-        # Need/Surplus before battery (sign convention: + means surplus)
-        delta = prod - load
-
-        # ----------------------- Battery discharge --------------------------
-        discharge_possible = min(soc, STEP_MAX, max(-delta / ETA, 0))
-        discharge_kwh = discharge_possible
-        delta += discharge_kwh * ETA  # discharge supplies load
-
-        # ----------------------- Battery charge -----------------------------
-        charge_possible = min(max(delta, 0) * ETA, STEP_MAX, soh_cap - soc)
-        charge_kwh = charge_possible
-        delta -= charge_kwh / ETA  # charging absorbs surplus
-
-        # Remaining delta handled by grid
-        grid_export = max(delta, 0)
-        grid_import = max(-delta, 0)
-
-        soc_new = soc + charge_kwh - discharge_kwh
-        return soc_new, charge_kwh, discharge_kwh, grid_export, grid_import
-
-    # ------------------------------- main loop ------------------------------
-    soc = np.zeros(STEPS_YEAR + 1, dtype=np.float32)  # reset every year
-    soh = 1.0  # start @100 % health
-
+    Optimized vectorized simulation with exact energy flow formulas.
+    Handles both kW and kWh input formats for PV data.
+    """
+    # Extract configuration parameters
+    dod = config['bess_dod']
+    c_rate = config['bess_c_rate']
+    efficiency = config['bess_efficiency']
+    pv_degr_rate = config['pv_degradation_rate']
+    calendar_degradation = config['bess_calendar_degradation_rate']
+    tot_cycles = config['bess_cycles']
+    
+    # Calculate battery parameters
+    kwh_netti = bess_kwh_nominal * dod  # Usable capacity
+    max_charge_discharge_per_step = bess_kwh_nominal * c_rate / 4  # C-rate limit for 15-min step
+    
+    # Convert data to numpy arrays for faster computation
+    pv_base = pv_production_baseline['pv_production_kwp'].to_numpy(dtype=np.float32)
+    cons = consumption_profile['consumption_kWh'].to_numpy(dtype=np.float32)
+    
+    # Check if PV data is already in kWh format
+    is_kwh_format = pv_production_baseline.attrs.get('is_kwh_format', False)
+    
+    # Debug information
+    if debug:
+        st.write("### 🔍 Debug Information - Simulation Input")
+        st.write(f"**PV System:** {pv_kwp} kWp")
+        st.write(f"**Battery:** {bess_kwh_nominal} kWh (usable: {kwh_netti:.1f} kWh)")
+        st.write(f"**PV data format:** {'kWh per interval' if is_kwh_format else 'kW instantaneous'}")
+        st.write(f"**PV baseline data points:** {len(pv_base)}")
+        
+        if is_kwh_format:
+            annual_prod_1kwp = pv_base.sum()
+        else:
+            annual_prod_1kwp = pv_base.sum() * 0.25
+        
+        st.write(f"**PV baseline stats (1 kWp):**")
+        st.write(f"  - Annual production: {annual_prod_1kwp:.0f} kWh")
+        st.write(f"  - Peak value: {pv_base.max():.3f} {'kWh/interval' if is_kwh_format else 'kW'}")
+        st.write(f"  - Non-zero values: {(pv_base > 0).sum()} of {len(pv_base)}")
+    
+    # Calculate base case annual cost
+    annual_consumption = cons.sum()
+    base_case_annual_cost = annual_consumption * config['grid_price_buy']
+    
+    # Simulation parameters
+    steps_per_year = 35040  # 96 steps/day * 365 days
+    
+    # Initialize tracking variables
+    annual_metrics = []
+    total_grid_import = 0
+    total_consumption = annual_consumption * 5  # 5 years total
+    
+    # Pre-calculate PV degradation factors
+    pv_degradation_factors = (1 - pv_degr_rate) ** np.arange(5)
+    
+    # Store detailed timestep data if requested
+    timestep_data = [] if export_details else None
+    
+    # Run 5-year simulation
     for year in range(5):
-        prod = pv_to_kwh(pv_base, pv_kwp, degr[year])
-        # Stunningly fast vectorised loop via Python – still OK (<1 s for 5 yrs)
-        charge, discharge, export, import_ = (
-            np.zeros(STEPS_YEAR, dtype=np.float32),
-            np.zeros(STEPS_YEAR, dtype=np.float32),
-            np.zeros(STEPS_YEAR, dtype=np.float32),
-            np.zeros(STEPS_YEAR, dtype=np.float32),
-        )
-        for t in range(STEPS_YEAR):
-            soc[t + 1], charge[t], discharge[t], export[t], import_[t] = energy_step(
-                prod[t], cons[t], soc[t], KWH_NET * soh
-            )
-
-        # Year‑end health degradation (cycle + calendar)
-        cyc_deg = (discharge.sum() / bess_kwh_nominal) * (1 / config["bess_cycles"])
-        cal_deg = config["bess_calendar_degradation_rate"]
-        soh = max(0.6, soh - cyc_deg - cal_deg)  # floor @60 %
-
-        soc_out.append(soc)
-
-        # Metrics
-        energy_buy = import_.sum()
-        energy_sell = export.sum()
-        self_cons = prod.sum() - energy_sell
-
-        annual_metrics.append(
-            {
-                "year": year + 1,
-                "pv_production": float(prod.sum()),
-                "consumption": float(cons.sum()),
-                "energy_bought": float(energy_buy),
-                "energy_sold": float(energy_sell),
-                "self_consumption": float(self_cons),
-                "self_sufficiency": self_cons / cons.sum(),
-                "energy_to_battery": float(charge.sum()),
-                "energy_from_battery": float(discharge.sum()),
-                "final_soh": float(soh),
-            }
-        )
-
-    # ---------------------------- financials ---------------------------------
+        # Apply PV degradation and scale by system size
+        if is_kwh_format:
+            # Data is already in kWh per 15-min interval
+            pv_production = pv_base * pv_kwp * pv_degradation_factors[year]
+        else:
+            # Data is in kW, convert to kWh per 15-min
+            pv_production = pv_base * pv_kwp * pv_degradation_factors[year] * 0.25
+        
+        if debug and year == 0:
+            st.write(f"**Year 1 PV production:**")
+            st.write(f"  - Total: {pv_production.sum():.0f} kWh")
+            st.write(f"  - Degradation factor: {pv_degradation_factors[year]:.3f}")
+        
+        # Initialize arrays for this year
+        soc = np.zeros(steps_per_year + 1, dtype=np.float32)
+        soh = np.zeros(steps_per_year + 1, dtype=np.float32)
+        kwh_scaricati = np.zeros(steps_per_year, dtype=np.float32)
+        kwh_caricati = np.zeros(steps_per_year, dtype=np.float32)
+        immissione = np.zeros(steps_per_year, dtype=np.float32)
+        acquisto = np.zeros(steps_per_year, dtype=np.float32)
+        
+        # Set initial SoH
+        soh[0] = 1.0 if year == 0 else annual_metrics[-1]['final_soh']
+        
+        # Simulate each 15-minute step
+        for t in range(steps_per_year):
+            produzione = pv_production[t]
+            consumo = cons[t]
+            
+            # Current max SoC based on battery health
+            max_soc_current = kwh_netti * soh[t]
+            
+            # 1. Calculate battery discharge
+            if consumo > produzione:
+                energy_deficit = (consumo - produzione) / efficiency
+                kwh_scaricati[t] = min(energy_deficit, soc[t], max_charge_discharge_per_step)
+            else:
+                kwh_scaricati[t] = 0
+            
+            # 2. Calculate grid export
+            if produzione > consumo:
+                excess_after_battery = soc[t] + produzione - consumo - max_soc_current
+                immissione[t] = max(0, excess_after_battery)
+            else:
+                immissione[t] = 0
+            
+            # 3. Calculate grid import
+            energy_from_battery = kwh_scaricati[t] * efficiency
+            acquisto[t] = max(0, consumo - produzione - energy_from_battery)
+            
+            # 4. Update SoC
+            if produzione >= consumo:
+                delta_soc = (produzione - consumo) * efficiency
+                actual_charge = min(delta_soc, max_soc_current - soc[t], max_charge_discharge_per_step)
+                soc[t+1] = soc[t] + actual_charge
+                kwh_caricati[t] = actual_charge / efficiency
+            else:
+                soc[t+1] = soc[t] - kwh_scaricati[t]
+                kwh_caricati[t] = 0
+            
+            # 5. Calculate SoH degradation
+            if t > 0:
+                cycle_degradation = (kwh_scaricati[t-1] / bess_kwh_nominal) * (0.2 * 1.15 / tot_cycles)
+            else:
+                cycle_degradation = 0
+            
+            calendar_deg_per_step = calendar_degradation / steps_per_year
+            soh[t+1] = max(0, soh[t] - calendar_deg_per_step - cycle_degradation)
+            
+            # Store timestep data if requested (daily aggregation)
+            if export_details and t % 96 == 0:
+                day_slice = slice(t, min(t + 96, steps_per_year))
+                timestep_data.append({
+                    'year': year + 1,
+                    'day': t // 96 + 1,
+                    'pv_production_kwh': pv_production[day_slice].sum(),
+                    'consumption_kwh': cons[day_slice].sum(),
+                    'battery_charge_kwh': kwh_caricati[day_slice].sum(),
+                    'battery_discharge_kwh': (kwh_scaricati[day_slice] * efficiency).sum(),
+                    'grid_import_kwh': acquisto[day_slice].sum(),
+                    'grid_export_kwh': immissione[day_slice].sum(),
+                    'avg_soc_kwh': soc[t:t+96].mean(),
+                    'soh_percent': soh[t] * 100
+                })
+        
+        # Calculate annual totals
+        yearly_metrics = {
+            'year': year + 1,
+            'pv_production': pv_production.sum(),
+            'consumption': annual_consumption,
+            'energy_bought': acquisto.sum(),
+            'energy_sold': immissione.sum(),
+            'energy_to_battery': kwh_caricati.sum(),
+            'energy_from_battery': (kwh_scaricati * efficiency).sum(),
+            'self_consumption': annual_consumption - acquisto.sum(),
+            'self_sufficiency': (annual_consumption - acquisto.sum()) / annual_consumption if annual_consumption > 0 else 0,
+            'final_soh': soh[steps_per_year],
+            'avg_soc': soc[1:steps_per_year+1].mean(),
+            'max_soc': soc[1:steps_per_year+1].max(),
+            'min_soc': soc[1:steps_per_year+1].min()
+        }
+        
+        annual_metrics.append(yearly_metrics)
+        total_grid_import += yearly_metrics['energy_bought']
+    
+    # Calculate financial metrics
     capex_pv = pv_kwp * (600 + 600 * np.exp(-pv_kwp / 290))
     capex_bess = bess_kwh_nominal * 150
     total_capex = capex_pv + capex_bess
-
+    
+    # O&M costs
     om_pv = (12 - 0.01 * pv_kwp) * pv_kwp
-    om_bess = 1_500 + capex_bess * 0.015
-    om_total = om_pv + om_bess
-
-    grid_buy = config["grid_price_buy"]
-    grid_sell = config["grid_price_sell"]
-
-    cash_flows.append(-total_capex)
-    for m in annual_metrics:
-        base_cost = m["consumption"] * grid_buy
-        energy_cost = m["energy_bought"] * grid_buy
-        revenue = m["energy_sold"] * grid_sell
-        cash_flows.append(base_cost - energy_cost + revenue - om_total)
-
-    # years 6‑10 – degrade 3 %/yr of last CF
-    for _ in range(5):
-        cash_flows.append(cash_flows[-1] * 0.97)
-
-    wacc = config["wacc"]
+    om_bess = 1500 + (capex_bess * 0.015)
+    total_om = om_pv + om_bess
+    
+    # Calculate cash flows
+    cash_flows = [-total_capex]  # Year 0
+    
+    for metrics in annual_metrics:
+        base_cost = metrics['consumption'] * config['grid_price_buy']
+        energy_cost = metrics['energy_bought'] * config['grid_price_buy']
+        energy_revenue = metrics['energy_sold'] * config['grid_price_sell']
+        
+        annual_cf = base_cost - energy_cost + energy_revenue - total_om
+        cash_flows.append(annual_cf)
+    
+    # Project cash flows for years 6-10
+    if cash_flows:
+        last_cf = cash_flows[-1]
+        for _ in range(5):
+            last_cf *= 0.97  # 3% degradation
+            cash_flows.append(last_cf)
+    
+    # Calculate NPV and payback
+    wacc = config['wacc']
     npv = sum(cf / ((1 + wacc) ** i) for i, cf in enumerate(cash_flows))
-
-    cum_cf = 0.0
-    payback = float("inf")
-    for i, cf in enumerate(cash_flows[1:], start=1):  # skip year0 capex
-        cum_cf += cf
-        if cum_cf >= 0:
-            payback = i
+    
+    # Calculate payback period
+    cumulative_cf = 0
+    payback_period = float('inf')
+    for i, cf in enumerate(cash_flows):
+        cumulative_cf += cf
+        if cumulative_cf > 0 and i > 0:
+            prev_cumulative = cumulative_cf - cf
+            fraction = -prev_cumulative / cf
+            payback_period = i - 1 + fraction
             break
-
-    # Base‑case NPV (no PV+BESS)
-    base_case_npv = -sum(
-        annual_metrics[0]["consumption"] * grid_buy / ((1 + wacc) ** (i + 1)) for i in range(10)
-    )
-
-    # ------------------------------ result -----------------------------------
-    return {
+    
+    # Calculate base case NPV
+    base_case_npv = -sum(base_case_annual_cost / ((1 + wacc) ** (i + 1)) for i in range(10))
+    
+    # Overall self-sufficiency rate
+    self_sufficiency_rate = (total_consumption - total_grid_import) / total_consumption if total_consumption > 0 else 0
+    
+    result = {
         "npv_eur": npv,
         "base_case_npv_eur": base_case_npv,
-        "payback_period_years": payback,
+        "payback_period_years": payback_period,
         "total_capex_eur": total_capex,
         "capex_pv": capex_pv,
         "capex_bess": capex_bess,
-        "self_sufficiency_rate": 1 - (sum(m["energy_bought"] for m in annual_metrics) / sum(cons)),
-        "final_soh_percent": soh * 100,
-        "om_costs": om_total,
+        "self_sufficiency_rate": self_sufficiency_rate,
+        "final_soh_percent": annual_metrics[-1]['final_soh'] * 100,
+        "om_costs": total_om,
         "om_pv": om_pv,
         "om_bess": om_bess,
+        "base_case_annual_cost": base_case_annual_cost,
         "annual_metrics": annual_metrics,
         "cash_flows": cash_flows,
-        "annual_consumption": cons.sum(),
+        "annual_consumption": annual_consumption
     }
+    
+    if export_details:
+        result["timestep_data"] = timestep_data
+    
+    return result
 
 
-# -----------------------------------------------------------------------------
-# 3. Adaptive grid‑search optimiser
-# -----------------------------------------------------------------------------
-
-def find_optimal_system(
-    user_inputs: Dict,
-    config: Dict,
-    pv_baseline: pd.DataFrame,
-    enable_debug: bool = False,
-) -> Optional[Dict]:
-    """Return best configuration based on 10‑year NPV.
-
-    v2.1 tweaks
-    -----------
-    • Progress bar updates every ~2 % of total iterations.
-    • Handles *battery‑size = 0* gracefully.
+def find_optimal_system(user_inputs: Dict, config: Dict, pv_baseline: pd.DataFrame, 
+                       enable_debug: bool = False) -> Optional[Dict]:
     """
-
-    import streamlit as st  # re‑import inside to keep backend deps optional
-
-    max_kwp = min(
-        user_inputs["available_area_m2"] / 5.0,  # area constraint
-        user_inputs["budget"] / 650,  # min cost constraint
-        500,
-    )
-    max_kwh = min(user_inputs["budget"] / 150, 1_000)
-
+    Optimized system search with adaptive grid search.
+    """
+    # Calculate maximum feasible sizes
+    max_kwp_from_area = user_inputs['available_area_m2'] / 5.0  # 5 m²/kWp
+    max_kwp_from_budget = user_inputs['budget'] / 650  # Minimum cost estimate
+    max_kwp = min(max_kwp_from_area, max_kwp_from_budget, 500)  # Cap at 500 kWp
+    
+    max_kwh = min(user_inputs['budget'] / 150, 1000)  # Cap at 1000 kWh
+    
+    # Ensure valid search ranges
     if max_kwp < 5:
-        st.error("Budget too low for minimum 5 kWp system")
+        st.error(f"Budget too low! Minimum PV system costs ~€3,250 (5 kWp)")
         return None
-
-    kwp_range = np.arange(5, max_kwp + 0.1, 5, dtype=np.int64)
-    kwh_range = np.arange(0, max_kwh + 0.1, 5, dtype=np.int64)
-
-    total_runs = len(kwp_range) * len(kwh_range)
-    pb = st.progress(0)
-    step_update = max(1, total_runs // 50)  # every 2 %
-
-    best: Optional[Dict] = None
-    best_npv = -np.inf
-    done = 0
-
-    for pv_kwp in kwp_range:
-        for bess_kwh in kwh_range:
-            # Budget filter
-            if pv_kwp * 650 + bess_kwh * 150 > user_inputs["budget"]:
+    
+    # Adaptive step sizes based on search space
+    n_pv_steps = min(20, int(max_kwp / 5))
+    n_bess_steps = min(20, int(max_kwh / 5))
+    
+    kwp_step = max(5, int(max_kwp / n_pv_steps))
+    kwh_step = max(5, int(max_kwh / n_bess_steps))
+    
+    pv_search_range = np.arange(kwp_step, max_kwp + kwp_step, kwp_step)
+    bess_search_range = np.arange(0, max_kwh + kwh_step, kwh_step)
+    
+    # Show search space
+    st.info(f"🔍 Searching {len(pv_search_range)} PV sizes × {len(bess_search_range)} battery sizes = {len(pv_search_range) * len(bess_search_range)} configurations")
+    
+    # Initialize search
+    best_result = None
+    best_npv = -float('inf')
+    results_matrix = []
+    valid_solutions = 0
+    
+    # Progress tracking
+    progress_bar = st.progress(0)
+    total_sims = len(pv_search_range) * len(bess_search_range)
+    sim_count = 0
+    
+    # Search for optimal combination
+    for i, pv_kwp in enumerate(pv_search_range):
+        for j, bess_kwh in enumerate(bess_search_range):
+            sim_count += 1
+            
+            # Update progress
+            if sim_count % max(1, total_sims // 50) == 0:
+                progress_bar.progress(min(sim_count / total_sims, 1.0))
+            
+            # Check budget constraint
+            capex_pv = pv_kwp * (600 + 600 * np.exp(-pv_kwp / 290))
+            capex_bess = bess_kwh * 150
+            
+            if (capex_pv + capex_bess) > user_inputs['budget']:
                 continue
-
-            res = run_simulation_vectorized(
-                pv_kwp,
-                bess_kwh,
-                pv_baseline,
-                user_inputs["consumption_profile_df"],
-                config,
-                debug=False,
+            
+            valid_solutions += 1
+            
+            # Run simulation
+            result = run_simulation_vectorized(
+                pv_kwp, bess_kwh, pv_baseline, 
+                user_inputs['consumption_profile_df'], 
+                config, debug=(enable_debug and valid_solutions == 1)
             )
-            if res["npv_eur"] > best_npv:
-                best_npv, best = res["npv_eur"], res | {"optimal_kwp": pv_kwp, "optimal_kwh": bess_kwh}
+            
+            result['pv_kwp'] = pv_kwp
+            result['bess_kwh'] = bess_kwh
+            results_matrix.append(result)
+            
+            # Track best result
+            if result['npv_eur'] > best_npv:
+                best_npv = result['npv_eur']
+                best_result = result.copy()
+                best_result['optimal_kwp'] = pv_kwp
+                best_result['optimal_kwh'] = bess_kwh
+    
+    progress_bar.empty()
+    
+    if valid_solutions > 0:
+        st.success(f"✅ Analyzed {valid_solutions} valid configurations")
+        
+        # Add results matrix for visualization
+        if best_result:
+            best_result['all_results'] = results_matrix
+            
+            # Show top 5 configurations
+            sorted_results = sorted(results_matrix, key=lambda x: x['npv_eur'], reverse=True)[:5]
+            
+            with st.expander("🏆 Top 5 Configurations by NPV"):
+                for idx, res in enumerate(sorted_results):
+                    st.write(f"**#{idx+1}:** {res['pv_kwp']} kWp / {res['bess_kwh']} kWh - NPV: €{res['npv_eur']:,.0f}")
+    else:
+        st.warning("No valid configurations found within constraints")
+    
+    return best_result
 
-            done += 1
-            if done % step_update == 0:
-                pb.progress(min(done / total_runs, 1.0))
 
-    pb.empty()
-    return best
-
-
-# -----------------------------------------------------------------------------
-# 4. Export helper – tighter table alignment
-# -----------------------------------------------------------------------------
-
-def export_detailed_calculations(
-    optimal_system: Dict,
-    config: Dict,
-    pv_kwp: float,
-    bess_kwh: float,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
-    """Return *(annual_df, financial_df, config_df, timestep_df?)* ready for CSV.
-
-    • Aligns **Year N** with *annual_metrics[N‑1]* to keep spreadsheets sane.
-    • Drops redundant cols and rounds to 3 dec.
-    """
-
-    ann_df = pd.DataFrame(optimal_system["annual_metrics"]).rename(columns={
-        "year": "Year",
-        "pv_production": "PV_Production_kWh",
-    })
-
-    fin_df = pd.DataFrame(
+def export_detailed_calculations(optimal_system: Dict, config: Dict, 
+                               pv_kwp: float, bess_kwh: float) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
+    """Export detailed calculations to CSV format."""
+    
+    # 1. Annual Summary
+    annual_data = []
+    for i, metrics in enumerate(optimal_system['annual_metrics']):
+        year_idx = metrics['year']
+        
+        base_cost = metrics['consumption'] * config['grid_price_buy']
+        energy_cost = metrics['energy_bought'] * config['grid_price_buy']
+        energy_revenue = metrics['energy_sold'] * config['grid_price_sell']
+        net_energy_cost = energy_cost - energy_revenue
+        savings = base_cost - net_energy_cost
+        
+        annual_data.append({
+            'Year': year_idx,
+            'PV_Production_kWh': metrics['pv_production'],
+            'Consumption_kWh': metrics['consumption'],
+            'Grid_Import_kWh': metrics['energy_bought'],
+            'Grid_Export_kWh': metrics['energy_sold'],
+            'Battery_Charge_kWh': metrics['energy_to_battery'],
+            'Battery_Discharge_kWh': metrics['energy_from_battery'],
+            'Self_Consumption_kWh': metrics['self_consumption'],
+            'Self_Sufficiency_%': metrics['self_sufficiency'] * 100,
+            'Battery_SoH_%': metrics['final_soh'] * 100,
+            'Base_Cost_EUR': base_cost,
+            'Energy_Buy_Cost_EUR': energy_cost,
+            'Energy_Sell_Revenue_EUR': energy_revenue,
+            'Net_Energy_Cost_EUR': net_energy_cost,
+            'O&M_Cost_EUR': optimal_system['om_costs'],
+            'Annual_Savings_EUR': savings,
+            'Cash_Flow_EUR': optimal_system['cash_flows'][year_idx] if year_idx < len(optimal_system['cash_flows']) else 0
+        })
+    
+    annual_df = pd.DataFrame(annual_data)
+    
+    # 2. Financial Details
+    financial_data = []
+    
+    # CAPEX breakdown
+    financial_data.extend([
         {
-            "Year": range(len(optimal_system["cash_flows"])),
-            "Cash_Flow_EUR": np.round(optimal_system["cash_flows"], 0),
-            "Cumulative_CF_EUR": np.round(np.cumsum(optimal_system["cash_flows"]), 0),
-        }
-    )
-
-    cfg_df = pd.DataFrame.from_dict(
-        {
-            "pv_kwp": pv_kwp,
-            "bess_kwh_nominal": bess_kwh,
-            **config,
+            'Category': 'CAPEX',
+            'Item': 'PV System',
+            'Formula': f'{pv_kwp} × (600 + 600 × exp(-{pv_kwp}/290))',
+            'Value_EUR': optimal_system['capex_pv']
         },
-        orient="index",
-        columns=["Value"],
-    ).reset_index(names="Parameter")
+        {
+            'Category': 'CAPEX',
+            'Item': 'Battery System',
+            'Formula': f'{bess_kwh} × 150',
+            'Value_EUR': optimal_system['capex_bess']
+        },
+        {
+            'Category': 'CAPEX',
+            'Item': 'Total CAPEX',
+            'Formula': 'PV + Battery',
+            'Value_EUR': optimal_system['total_capex_eur']
+        }
+    ])
+    
+    # O&M breakdown
+    financial_data.extend([
+        {
+            'Category': 'O&M (Annual)',
+            'Item': 'PV O&M',
+            'Formula': f'(12 - 0.01 × {pv_kwp}) × {pv_kwp}',
+            'Value_EUR': optimal_system['om_pv']
+        },
+        {
+            'Category': 'O&M (Annual)',
+            'Item': 'Battery O&M',
+            'Formula': f'1500 + ({optimal_system["capex_bess"]} × 0.015)',
+            'Value_EUR': optimal_system['om_bess']
+        },
+        {
+            'Category': 'O&M (Annual)',
+            'Item': 'Total O&M',
+            'Formula': 'PV O&M + Battery O&M',
+            'Value_EUR': optimal_system['om_costs']
+        }
+    ])
+    
+    # NPV details
+    for i, cf in enumerate(optimal_system['cash_flows'][:11]):  # First 11 entries (year 0-10)
+        discount_factor = 1 / ((1 + config['wacc']) ** i)
+        discounted_cf = cf * discount_factor
+        
+        financial_data.append({
+            'Category': f'Cash Flow Year {i}',
+            'Item': 'Annual Cash Flow',
+            'Formula': 'Base Cost - Energy Cost + Energy Revenue - O&M' if i > 0 else 'Initial Investment',
+            'Value_EUR': cf
+        })
+        financial_data.append({
+            'Category': f'Cash Flow Year {i}',
+            'Item': 'Discounted Cash Flow',
+            'Formula': f'{cf:.2f} × {discount_factor:.4f}',
+            'Value_EUR': discounted_cf
+        })
+    
+    financial_data.extend([
+        {
+            'Category': 'Final Results',
+            'Item': 'NPV',
+            'Formula': 'Sum of all discounted cash flows',
+            'Value_EUR': optimal_system['npv_eur']
+        },
+        {
+            'Category': 'Final Results',
+            'Item': 'Payback Period',
+            'Formula': 'Year when cumulative CF > 0',
+            'Value_EUR': optimal_system['payback_period_years']
+        }
+    ])
+    
+    financial_df = pd.DataFrame(financial_data)
+    
+    # 3. Configuration Parameters
+    config_data = [
+        {'Parameter': 'PV_Size_kWp', 'Value': pv_kwp, 'Unit': 'kWp'},
+        {'Parameter': 'Battery_Size_kWh', 'Value': bess_kwh, 'Unit': 'kWh'},
+        {'Parameter': 'Battery_DoD', 'Value': config['bess_dod'] * 100, 'Unit': '%'},
+        {'Parameter': 'Battery_C_Rate', 'Value': config['bess_c_rate'], 'Unit': 'C'},
+        {'Parameter': 'Battery_Efficiency', 'Value': config['bess_efficiency'] * 100, 'Unit': '%'},
+        {'Parameter': 'Battery_Cycles', 'Value': config['bess_cycles'], 'Unit': 'cycles'},
+        {'Parameter': 'PV_Degradation_Rate', 'Value': config['pv_degradation_rate'] * 100, 'Unit': '%/year'},
+        {'Parameter': 'Battery_Calendar_Degradation', 'Value': config['bess_calendar_degradation_rate'] * 100, 'Unit': '%/year'},
+        {'Parameter': 'Grid_Buy_Price', 'Value': config['grid_price_buy'], 'Unit': 'EUR/kWh'},
+        {'Parameter': 'Grid_Sell_Price', 'Value': config['grid_price_sell'], 'Unit': 'EUR/kWh'},
+        {'Parameter': 'WACC', 'Value': config['wacc'] * 100, 'Unit': '%'},
+        {'Parameter': 'Annual_Consumption', 'Value': optimal_system['annual_consumption'], 'Unit': 'kWh'}
+    ]
+    
+    config_df = pd.DataFrame(config_data)
+    
+    # 4. Timestep data if available
+    timestep_df = None
+    if 'timestep_data' in optimal_system and optimal_system['timestep_data']:
+        timestep_df = pd.DataFrame(optimal_system['timestep_data'])
+    
+    return annual_df, financial_df, config_df, timestep_df
 
-    timestep_df = optimal_system.get("timestep_data")
-    return ann_df, fin_df, cfg_df, timestep_df
 
 def create_calculation_report_zip(annual_df: pd.DataFrame, financial_df: pd.DataFrame, 
                                 config_df: pd.DataFrame, timestep_df: Optional[pd.DataFrame] = None) -> io.BytesIO:
