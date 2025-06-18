@@ -33,7 +33,572 @@ def load_txt_file(uploaded_file, expected_rows: int = 35040) -> Tuple[bool, str,
                     value = float(line.replace(',', '.'))
                     values.append(value)
                 except ValueError as e:
-                    return False, f"Error parsing line {i+1}: '{line}' is not a valid number", None
+                    return '\n'.join(lines)
+
+
+# ==============================================================================
+# SECTION 2: STREAMLIT UI - VERSION 3.0 WITH TXT SUPPORT
+# ==============================================================================
+
+def build_ui():
+    """Streamlit UI with TXT file support."""
+    st.set_page_config(
+        page_title="PV & BESS Optimizer v3",
+        page_icon="⚡",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # Custom CSS
+    st.markdown("""
+        <style>
+        .stMetric {
+            background-color: #f0f2f6;
+            padding: 15px;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .upload-text {
+            font-size: 14px;
+            color: #666;
+            margin-top: 10px;
+        }
+        .highlight-box {
+            background-color: #e3f2fd;
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 4px solid #2196F3;
+            margin: 10px 0;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    
+    st.title("⚡ PV & BESS Optimizer v3.0")
+    st.markdown("""
+        ### Optimized Solar + Battery Sizing Calculator with TXT Support
+        Find the perfect PV and battery system configuration based on your consumption profile and PV production data.
+        
+        **🎯 Key Features:**
+        - **NEW:** TXT file format for improved accuracy
+        - 5-year simulation with 15-minute resolution (35,040 intervals/year)
+        - Excel-like calculation approach with columnar data structure
+        - Automatic handling of European decimal format (comma separator)
+    """)
+    
+    # Sidebar configuration
+    with st.sidebar:
+        st.header("🔧 Configuration")
+        
+        # Project constraints
+        st.subheader("1. Project Constraints")
+        budget = st.number_input(
+            "Maximum Budget (€)",
+            min_value=10000,
+            max_value=500000,
+            value=80000,
+            step=1000,
+            help="Total available budget for PV and BESS installation"
+        )
+        
+        available_area_m2 = st.number_input(
+            "Available Area for PV (m²)",
+            min_value=10,
+            max_value=5000,
+            value=400,
+            step=10,
+            help="Total roof or ground area available for solar panels (5 m²/kWp)"
+        )
+        
+        # PV Production Data
+        st.subheader("2. PV Production Data (TXT)")
+        st.markdown("""
+            <div class="highlight-box">
+            <b>📁 Upload PV production baseline (1 kWp)</b><br>
+            • 35,040 lines (one value per line)<br>
+            • Values in <b>kWh per 15-min interval</b><br>
+            • Comma (,) as decimal separator<br>
+            • Expected annual: 800-1800 kWh/kWp
+            </div>
+        """, unsafe_allow_html=True)
+        
+        pv_file = st.file_uploader(
+            "Upload PV production data (TXT)",
+            type="txt",
+            help="TXT with 35,040 values for 1 kWp system",
+            key="pv_upload"
+        )
+        
+        # Show sample PV data format
+        with st.expander("📋 View Sample PV Data Format"):
+            st.code("""
+0,000000
+0,000000
+0,000000
+0,031250
+0,071250
+0,103000
+...
+(35,040 lines total)
+            """)
+            
+            st.info("""
+            💡 **PV Data Requirements:**
+            
+            - **Format:** One value per line, comma as decimal separator
+            - **Unit:** kWh per 15-minute interval
+            - **System size:** Data for 1 kWp reference system
+            - **Typical values:** 0 to ~0,25 kWh per interval
+            - **Annual total:** 800-1800 kWh for 1 kWp
+            
+            The system will scale these values by the optimized PV size (kWp).
+            """)
+            
+            if st.button("📊 Generate Sample PV Data (1 kWp)"):
+                # Generate sample PV data
+                pv_content = generate_sample_txt_file('pv', annual_value=1373)
+                
+                # Show preview
+                st.write("**Preview (first 10 lines):**")
+                preview_lines = pv_content.split('\n')[:10]
+                st.code('\n'.join(preview_lines))
+                
+                # Calculate annual
+                values = [float(line.replace(',', '.')) for line in pv_content.split('\n')]
+                annual_prod = sum(values)
+                st.success(f"Annual production: {annual_prod:.0f} kWh/kWp")
+                
+                st.download_button(
+                    label="📥 Download Sample PV Data (TXT)",
+                    data=pv_content,
+                    file_name="pv_production_1kwp.txt",
+                    mime="text/plain",
+                    key="download_pv_sample"
+                )
+        
+        # Consumption Profile
+        st.subheader("3. Consumption Profile (TXT)")
+        st.markdown("""
+            <div class="highlight-box">
+            <b>📁 Upload consumption data</b><br>
+            • 35,040 lines (one value per line)<br>
+            • Values in <b>kWh per 15-min interval</b><br>
+            • Comma (,) as decimal separator<br>
+            • Repeated for 5 years in simulation
+            </div>
+        """, unsafe_allow_html=True)
+        
+        consumption_file = st.file_uploader(
+            "Upload consumption data (TXT)",
+            type="txt",
+            help="TXT with 35,040 consumption values",
+            key="consumption_upload"
+        )
+        
+        # Sample consumption data generator
+        with st.expander("📋 Generate Sample Consumption Data"):
+            st.code("""
+0,125000
+0,130000
+0,128000
+0,135000
+...
+(35,040 lines total)
+            """)
+            
+            annual_target = st.number_input(
+                "Target annual consumption (kWh)",
+                min_value=1000,
+                max_value=100000,
+                value=10000,
+                step=1000,
+                key="consumption_target"
+            )
+            
+            if st.button("📊 Generate Sample Consumption Data"):
+                # Generate sample consumption data
+                cons_content = generate_sample_txt_file('consumption', annual_value=annual_target)
+                
+                # Show preview
+                st.write("**Preview (first 10 lines):**")
+                preview_lines = cons_content.split('\n')[:10]
+                st.code('\n'.join(preview_lines))
+                
+                # Calculate stats
+                values = [float(line.replace(',', '.')) for line in cons_content.split('\n')]
+                annual_cons = sum(values)
+                peak_load = max(values) * 4  # Convert to kW
+                
+                st.success(f"Annual consumption: {annual_cons:.0f} kWh | Peak load: {peak_load:.1f} kW")
+                
+                st.download_button(
+                    label="📥 Download Sample Consumption Data (TXT)",
+                    data=cons_content,
+                    file_name=f"consumption_{int(annual_target)}kwh.txt",
+                    mime="text/plain",
+                    key="download_consumption_sample"
+                )
+        
+        # Advanced settings
+        with st.expander("⚙️ Advanced Settings"):
+            st.write("**Electricity Prices**")
+            col1, col2 = st.columns(2)
+            with col1:
+                grid_buy = st.number_input("Buy Price (€/kWh)", value=0.35, format="%.3f", min_value=0.10, max_value=1.00)
+            with col2:
+                grid_sell = st.number_input("Sell Price (€/kWh)", value=0.12, format="%.3f", min_value=0.01, max_value=0.50)
+            
+            st.write("**Financial Parameters**")
+            wacc = st.slider("WACC (%)", min_value=1, max_value=15, value=7) / 100
+            
+            st.write("**Battery Technical Parameters**")
+            col1, col2 = st.columns(2)
+            with col1:
+                dod = st.slider("Depth of Discharge (%)", 70, 95, 85) / 100
+                c_rate = st.slider("C-Rate", 0.3, 1.0, 0.7, 0.1)
+            with col2:
+                bess_cycles = st.slider("Life Cycles", 6000, 10000, 7000, 100)
+                efficiency = st.slider("Round-trip Efficiency (%)", 85, 98, 95) / 100
+            
+            st.write("**Degradation Rates**")
+            col1, col2 = st.columns(2)
+            with col1:
+                pv_degr = st.slider("PV Annual Degradation (%)", 0.2, 2.0, 1.0) / 100
+            with col2:
+                bess_cal_degr = st.slider("Battery Calendar Degradation (%/year)", 0.5, 3.0, 1.5) / 100
+            
+            st.write("**Debug & Export Options**")
+            enable_debug = st.checkbox("Enable debug mode", value=False)
+            export_daily_data = st.checkbox("Export daily timestep data", value=False)
+    
+    # Main content area
+    if pv_file is not None and consumption_file is not None:
+        try:
+            # Load PV data from TXT
+            is_valid_pv, message_pv, pv_data = load_txt_file(pv_file, expected_rows=35040)
+            
+            if not is_valid_pv:
+                st.error(f"❌ PV data error: {message_pv}")
+                return
+            
+            # Validate PV data
+            is_valid_pv, message_pv, pv_metadata = validate_pv_txt_data(pv_data)
+            
+            if not is_valid_pv:
+                st.error(f"❌ PV validation error: {message_pv}")
+                return
+            
+            st.success(f"✅ PV data loaded: {message_pv}")
+            
+            # Show PV statistics
+            with st.expander("📊 PV Production Statistics (1 kWp baseline)"):
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("Annual Production", f"{pv_metadata['annual_production']:.0f} kWh/kWp")
+                with col2:
+                    st.metric("Peak Value", f"{pv_metadata['peak_value']:.3f} kWh/interval")
+                with col3:
+                    st.metric("Capacity Factor", f"{pv_metadata['capacity_factor']:.1f}%")
+                with col4:
+                    st.metric("Daylight Hours", f"{pv_metadata['daylight_hours']:.0f}")
+                
+                # Show daily profile
+                st.write("**Average Daily Profile (1 kWp):**")
+                hourly_values = []
+                for h in range(24):
+                    hour_data = pv_data[h*4:(h+1)*4]
+                    hourly_values.append(hour_data.sum())  # Sum kWh for the hour
+                
+                profile_df = pd.DataFrame({
+                    'Hour': range(24),
+                    'Energy (kWh)': hourly_values
+                })
+                
+                st.line_chart(profile_df.set_index('Hour')['Energy (kWh)'])
+            
+            # Load consumption data from TXT
+            is_valid_cons, message_cons, consumption_data = load_txt_file(consumption_file, expected_rows=35040)
+            
+            if not is_valid_cons:
+                st.error(f"❌ Consumption data error: {message_cons}")
+                return
+            
+            # Validate consumption data
+            is_valid_cons, message_cons, cons_metadata = validate_consumption_txt_data(consumption_data)
+            
+            if not is_valid_cons:
+                st.error(f"❌ Consumption validation error: {message_cons}")
+                return
+            
+            st.success(f"✅ Consumption data loaded: {message_cons}")
+            
+            # Display consumption statistics
+            st.subheader("📊 Consumption Profile Summary")
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("Annual Consumption", f"{cons_metadata['annual_consumption']:,.0f} kWh")
+            with col2:
+                st.metric("Average Daily", f"{cons_metadata['daily_average']:,.1f} kWh")
+            with col3:
+                st.metric("Peak Load", f"{cons_metadata['peak_load_kw']:,.1f} kW")
+            with col4:
+                st.metric("Base Load", f"{cons_metadata['base_load_kw']:,.1f} kW")
+            
+        except Exception as e:
+            st.error(f"""
+                ❌ Error reading files: {str(e)}
+                
+                **Please check your TXT file format:**
+                - One value per line
+                - Comma (,) as decimal separator
+                - Exactly 35,040 lines
+                - No empty lines or headers
+            """)
+            return
+        
+        # Run optimization
+        st.markdown("---")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            run_optimization = st.button("🚀 Find Optimal System", type="primary", use_container_width=True)
+        with col2:
+            quick_test = st.button("⚡ Quick Test (5 configs)", use_container_width=True)
+        with col3:
+            export_results = st.button("📊 Export Last Results", use_container_width=True, 
+                                     disabled='optimal_system' not in st.session_state)
+        
+        if run_optimization or quick_test:
+            # Prepare inputs
+            user_inputs = {
+                "budget": budget,
+                "available_area_m2": available_area_m2
+            }
+            
+            config = {
+                'bess_dod': dod,
+                'bess_c_rate': c_rate,
+                'bess_efficiency': efficiency,
+                'bess_cycles': bess_cycles,
+                'pv_degradation_rate': pv_degr,
+                'bess_calendar_degradation_rate': bess_cal_degr,
+                'grid_price_buy': grid_buy,
+                'grid_price_sell': grid_sell,
+                'wacc': wacc
+            }
+            
+            if quick_test:
+                # Quick test of specific configurations
+                st.subheader("⚡ Quick Test Results")
+                
+                test_configs = [
+                    (50, 50, "Balanced medium"),
+                    (100, 100, "Balanced large"),
+                    (150, 75, "PV-heavy"),
+                    (75, 150, "Battery-heavy"),
+                    (100, 0, "PV only")
+                ]
+                
+                results = []
+                for pv_kwp, bess_kwh, desc in test_configs:
+                    # Check constraints
+                    capex_pv = pv_kwp * (600 + 600 * np.exp(-pv_kwp / 290))
+                    capex_bess = bess_kwh * 150
+                    total_capex = capex_pv + capex_bess
+                    
+                    if total_capex <= budget and pv_kwp <= available_area_m2 / 5.0:
+                        result = run_simulation_vectorized_v3(
+                            pv_kwp, bess_kwh, pv_data, consumption_data, 
+                            config, export_details=export_daily_data
+                        )
+                        
+                        results.append({
+                            'Configuration': f"{pv_kwp} kWp / {bess_kwh} kWh",
+                            'Description': desc,
+                            'CAPEX (€)': f"{total_capex:,.0f}",
+                            'NPV (€)': f"{result['npv_eur']:,.0f}",
+                            'Payback (years)': f"{result['payback_period_years']:.1f}" if result['payback_period_years'] < 25 else "> 25",
+                            'Self-sufficiency (%)': f"{result['self_sufficiency_rate']*100:.1f}"
+                        })
+                
+                df_results = pd.DataFrame(results)
+                st.dataframe(df_results, use_container_width=True)
+                
+            else:
+                # Full optimization
+                with st.spinner('🔄 Running optimization...'):
+                    optimal_system = find_optimal_system_v3(
+                        user_inputs, config, pv_data, consumption_data, enable_debug
+                    )
+                    
+                    if optimal_system:
+                        # Save to session state
+                        st.session_state['optimal_system'] = optimal_system
+                        st.session_state['config'] = config
+                        st.session_state['export_daily'] = export_daily_data
+                        
+                        # Display results
+                        st.success("✅ Optimization Complete!")
+                        
+                        # Key metrics
+                        st.header("🏆 Optimal System Configuration")
+                        col1, col2, col3, col4 = st.columns(4)
+                        
+                        with col1:
+                            st.metric("PV System", f"{optimal_system['optimal_kwp']} kWp")
+                        with col2:
+                            st.metric("Battery", f"{optimal_system['optimal_kwh']} kWh")
+                        with col3:
+                            payback_text = f"{optimal_system['payback_period_years']:.1f} years" if optimal_system['payback_period_years'] < 25 else "> 25 years"
+                            st.metric("Payback", payback_text)
+                        with col4:
+                            st.metric("Self-Sufficiency", f"{optimal_system['self_sufficiency_rate'] * 100:.1f}%")
+                        
+                        # Financial analysis
+                        st.subheader("💰 Financial Analysis")
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            st.metric("Total Investment", f"€{optimal_system['total_capex_eur']:,.0f}")
+                        with col2:
+                            st.metric("10-Year NPV", f"€{optimal_system['npv_eur']:,.0f}")
+                        with col3:
+                            st.metric("Annual O&M", f"€{optimal_system['om_costs']:,.0f}")
+                        
+                        # Cash flow visualization
+                        with st.expander("📊 View Cash Flow Analysis"):
+                            cf_data = optimal_system['cash_flows'][:11]  # 11 years
+                            cumulative_cf = np.cumsum(cf_data)
+                            
+                            cf_df = pd.DataFrame({
+                                'Year': range(len(cf_data)),
+                                'Annual Cash Flow': cf_data,
+                                'Cumulative Cash Flow': cumulative_cf
+                            })
+                            
+                            st.line_chart(cf_df.set_index('Year')['Cumulative Cash Flow'])
+                            st.caption("Cumulative cash flow showing payback period")
+                        
+                        # Annual metrics
+                        with st.expander("📈 View Annual Energy Flows"):
+                            annual_metrics_df = pd.DataFrame(optimal_system['annual_metrics'])
+                            annual_metrics_df['Year'] = annual_metrics_df['year']
+                            
+                            # Energy flows chart
+                            energy_cols = ['pv_production', 'energy_bought', 'energy_sold', 'energy_from_battery']
+                            energy_df = annual_metrics_df[['Year'] + energy_cols].set_index('Year')
+                            energy_df.columns = ['PV Production', 'Grid Import', 'Grid Export', 'Battery Discharge']
+                            
+                            st.bar_chart(energy_df)
+                            st.caption("Annual energy flows (kWh)")
+                    else:
+                        st.error("❌ No valid solution found within constraints")
+        
+        # Export results section
+        if export_results and 'optimal_system' in st.session_state:
+            st.markdown("---")
+            st.subheader("📊 Export Detailed Calculations")
+            
+            optimal_system = st.session_state['optimal_system']
+            config = st.session_state['config']
+            
+            try:
+                # Generate reports
+                annual_df, financial_df, config_df, timestep_df = export_detailed_calculations(
+                    optimal_system, config,
+                    optimal_system['optimal_kwp'],
+                    optimal_system['optimal_kwh']
+                )
+                
+                # Create download options
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # ZIP download
+                    zip_buffer = create_calculation_report_zip(annual_df, financial_df, config_df, timestep_df)
+                    st.download_button(
+                        label="📦 Download Complete Report (ZIP)",
+                        data=zip_buffer.getvalue(),
+                        file_name=f"pv_bess_report_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                        mime="application/zip"
+                    )
+                
+                with col2:
+                    # Summary text
+                    summary_text = f"""
+PV & BESS Optimization Results
+==============================
+Date: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+Optimal Configuration:
+- PV System: {optimal_system['optimal_kwp']} kWp
+- Battery: {optimal_system['optimal_kwh']} kWh
+- Total CAPEX: €{optimal_system['total_capex_eur']:,.0f}
+
+Financial Metrics:
+- 10-Year NPV: €{optimal_system['npv_eur']:,.0f}
+- Payback Period: {optimal_system['payback_period_years']:.1f} years
+- Self-Sufficiency: {optimal_system['self_sufficiency_rate'] * 100:.1f}%
+
+Parameters Used:
+- Grid Buy Price: €{config['grid_price_buy']:.3f}/kWh
+- Grid Sell Price: €{config['grid_price_sell']:.3f}/kWh
+- WACC: {config['wacc']*100:.1f}%
+"""
+                    st.download_button(
+                        label="📄 Download Summary (TXT)",
+                        data=summary_text,
+                        file_name=f"pv_bess_summary_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                        mime="text/plain"
+                    )
+                
+                st.success("✅ Export files ready for download!")
+                
+            except Exception as e:
+                st.error(f"❌ Export error: {str(e)}")
+    
+    else:
+        # Instructions
+        st.info("""
+            📁 **Please upload both TXT files to begin:**
+            
+            1. **PV Production Data** (TXT)
+               - 35,040 lines (one value per line)
+               - Values in kWh per 15-minute interval
+               - Data for 1 kWp reference system
+               - Comma (,) as decimal separator
+               - Expected annual: 800-1800 kWh/kWp
+               
+            2. **Consumption Data** (TXT)
+               - 35,040 lines (one value per line)
+               - Values in kWh per 15-minute interval
+               - Comma (,) as decimal separator
+               - Will be repeated for 5-year simulation
+               
+            **💡 TXT Format Example:**
+            ```
+            0,125000
+            0,130500
+            0,128750
+            ...
+            ```
+            
+            Use the sample generators in the sidebar to create properly formatted files!
+        """)
+    
+    # Footer
+    st.markdown("---")
+    st.markdown("""
+        <div style='text-align: center; color: #888;'>
+            <p>PV & BESS Optimizer v3.0 - TXT File Support</p>
+            <p>Optimized for accuracy with European decimal format</p>
+            <p>Made with ❤️ using Streamlit</p>
+        </div>
+    """, unsafe_allow_html=True)
+
+
+if __name__ == "__main__":
+    build_ui() False, f"Error parsing line {i+1}: '{line}' is not a valid number", None
         
         # Convert to numpy array
         data_array = np.array(values, dtype=np.float32)
@@ -747,568 +1312,4 @@ def generate_sample_txt_file(data_type: str, annual_value: float = None) -> str:
         formatted_value = f"{value:.6f}".replace('.', ',')
         lines.append(formatted_value)
     
-    return '\n'.join(lines)
-
-
-# ==============================================================================
-# SECTION 2: STREAMLIT UI - VERSION 3.0 WITH TXT SUPPORT
-# ==============================================================================
-
-def build_ui():
-    """Streamlit UI with TXT file support."""
-    st.set_page_config(
-        page_title="PV & BESS Optimizer v3",
-        page_icon="⚡",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-    
-    # Custom CSS
-    st.markdown("""
-        <style>
-        .stMetric {
-            background-color: #f0f2f6;
-            padding: 15px;
-            border-radius: 10px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        .upload-text {
-            font-size: 14px;
-            color: #666;
-            margin-top: 10px;
-        }
-        .highlight-box {
-            background-color: #e3f2fd;
-            padding: 15px;
-            border-radius: 8px;
-            border-left: 4px solid #2196F3;
-            margin: 10px 0;
-        }
-        </style>
-    """, unsafe_allow_html=True)
-    
-    st.title("⚡ PV & BESS Optimizer v3.0")
-    st.markdown("""
-        ### Optimized Solar + Battery Sizing Calculator with TXT Support
-        Find the perfect PV and battery system configuration based on your consumption profile and PV production data.
-        
-        **🎯 Key Features:**
-        - **NEW:** TXT file format for improved accuracy
-        - 5-year simulation with 15-minute resolution (35,040 intervals/year)
-        - Excel-like calculation approach with columnar data structure
-        - Automatic handling of European decimal format (comma separator)
-    """)
-    
-    # Sidebar configuration
-    with st.sidebar:
-        st.header("🔧 Configuration")
-        
-        # Project constraints
-        st.subheader("1. Project Constraints")
-        budget = st.number_input(
-            "Maximum Budget (€)",
-            min_value=10000,
-            max_value=500000,
-            value=80000,
-            step=1000,
-            help="Total available budget for PV and BESS installation"
-        )
-        
-        available_area_m2 = st.number_input(
-            "Available Area for PV (m²)",
-            min_value=10,
-            max_value=5000,
-            value=400,
-            step=10,
-            help="Total roof or ground area available for solar panels (5 m²/kWp)"
-        )
-        
-        # PV Production Data
-        st.subheader("2. PV Production Data (TXT)")
-        st.markdown("""
-            <div class="highlight-box">
-            <b>📁 Upload PV production baseline (1 kWp)</b><br>
-            • 35,040 lines (one value per line)<br>
-            • Values in <b>kWh per 15-min interval</b><br>
-            • Comma (,) as decimal separator<br>
-            • Expected annual: 800-1800 kWh/kWp
-            </div>
-        """, unsafe_allow_html=True)
-        
-        pv_file = st.file_uploader(
-            "Upload PV production data (TXT)",
-            type="txt",
-            help="TXT with 35,040 values for 1 kWp system",
-            key="pv_upload"
-        )
-        
-        # Show sample PV data format
-        with st.expander("📋 View Sample PV Data Format"):
-            st.code("""
-0,000000
-0,000000
-0,000000
-0,031250
-0,071250
-0,103000
-...
-(35,040 lines total)
-            """)
-            
-            st.info("""
-            💡 **PV Data Requirements:**
-            
-            - **Format:** One value per line, comma as decimal separator
-            - **Unit:** kWh per 15-minute interval
-            - **System size:** Data for 1 kWp reference system
-            - **Typical values:** 0 to ~0,25 kWh per interval
-            - **Annual total:** 800-1800 kWh for 1 kWp
-            
-            The system will scale these values by the optimized PV size (kWp).
-            """)
-            
-            if st.button("📊 Generate Sample PV Data (1 kWp)"):
-                # Generate sample PV data
-                pv_content = generate_sample_txt_file('pv', annual_value=1373)
-                
-                # Show preview
-                st.write("**Preview (first 10 lines):**")
-                preview_lines = pv_content.split('\n')[:10]
-                st.code('\n'.join(preview_lines))
-                
-                # Calculate annual
-                values = [float(line.replace(',', '.')) for line in pv_content.split('\n')]
-                annual_prod = sum(values)
-                st.success(f"Annual production: {annual_prod:.0f} kWh/kWp")
-                
-                st.download_button(
-                    label="📥 Download Sample PV Data (TXT)",
-                    data=pv_content,
-                    file_name="pv_production_1kwp.txt",
-                    mime="text/plain",
-                    key="download_pv_sample"
-                )
-        
-        # Consumption Profile
-        st.subheader("3. Consumption Profile (TXT)")
-        st.markdown("""
-            <div class="highlight-box">
-            <b>📁 Upload consumption data</b><br>
-            • 35,040 lines (one value per line)<br>
-            • Values in <b>kWh per 15-min interval</b><br>
-            • Comma (,) as decimal separator<br>
-            • Repeated for 5 years in simulation
-            </div>
-        """, unsafe_allow_html=True)
-        
-        consumption_file = st.file_uploader(
-            "Upload consumption data (TXT)",
-            type="txt",
-            help="TXT with 35,040 consumption values",
-            key="consumption_upload"
-        )
-        
-        # Sample consumption data generator
-        with st.expander("📋 Generate Sample Consumption Data"):
-            st.code("""
-0,125000
-0,130000
-0,128000
-0,135000
-...
-(35,040 lines total)
-            """)
-            
-            annual_target = st.number_input(
-                "Target annual consumption (kWh)",
-                min_value=1000,
-                max_value=100000,
-                value=10000,
-                step=1000,
-                key="consumption_target"
-            )
-            
-            if st.button("📊 Generate Sample Consumption Data"):
-                # Generate sample consumption data
-                cons_content = generate_sample_txt_file('consumption', annual_value=annual_target)
-                
-                # Show preview
-                st.write("**Preview (first 10 lines):**")
-                preview_lines = cons_content.split('\n')[:10]
-                st.code('\n'.join(preview_lines))
-                
-                # Calculate stats
-                values = [float(line.replace(',', '.')) for line in cons_content.split('\n')]
-                annual_cons = sum(values)
-                peak_load = max(values) * 4  # Convert to kW
-                
-                st.success(f"Annual consumption: {annual_cons:.0f} kWh | Peak load: {peak_load:.1f} kW")
-                
-                st.download_button(
-                    label="📥 Download Sample Consumption Data (TXT)",
-                    data=cons_content,
-                    file_name=f"consumption_{int(annual_target)}kwh.txt",
-                    mime="text/plain",
-                    key="download_consumption_sample"
-                )
-        
-        # Advanced settings
-        with st.expander("⚙️ Advanced Settings"):
-            st.write("**Electricity Prices**")
-            col1, col2 = st.columns(2)
-            with col1:
-                grid_buy = st.number_input("Buy Price (€/kWh)", value=0.35, format="%.3f", min_value=0.10, max_value=1.00)
-            with col2:
-                grid_sell = st.number_input("Sell Price (€/kWh)", value=0.12, format="%.3f", min_value=0.01, max_value=0.50)
-            
-            st.write("**Financial Parameters**")
-            wacc = st.slider("WACC (%)", min_value=1, max_value=15, value=7) / 100
-            
-            st.write("**Battery Technical Parameters**")
-            col1, col2 = st.columns(2)
-            with col1:
-                dod = st.slider("Depth of Discharge (%)", 70, 95, 85) / 100
-                c_rate = st.slider("C-Rate", 0.3, 1.0, 0.7, 0.1)
-            with col2:
-                bess_cycles = st.slider("Life Cycles", 6000, 10000, 7000, 100)
-                efficiency = st.slider("Round-trip Efficiency (%)", 85, 98, 95) / 100
-            
-            st.write("**Degradation Rates**")
-            col1, col2 = st.columns(2)
-            with col1:
-                pv_degr = st.slider("PV Annual Degradation (%)", 0.2, 2.0, 1.0) / 100
-            with col2:
-                bess_cal_degr = st.slider("Battery Calendar Degradation (%/year)", 0.5, 3.0, 1.5) / 100
-            
-            st.write("**Debug & Export Options**")
-            enable_debug = st.checkbox("Enable debug mode", value=False)
-            export_daily_data = st.checkbox("Export daily timestep data", value=False)
-    
-    # Main content area
-    if pv_file is not None and consumption_file is not None:
-        try:
-            # Load PV data from TXT
-            is_valid_pv, message_pv, pv_data = load_txt_file(pv_file, expected_rows=35040)
-            
-            if not is_valid_pv:
-                st.error(f"❌ PV data error: {message_pv}")
-                return
-            
-            # Validate PV data
-            is_valid_pv, message_pv, pv_metadata = validate_pv_txt_data(pv_data)
-            
-            if not is_valid_pv:
-                st.error(f"❌ PV validation error: {message_pv}")
-                return
-            
-            st.success(f"✅ PV data loaded: {message_pv}")
-            
-            # Show PV statistics
-            with st.expander("📊 PV Production Statistics (1 kWp baseline)"):
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    st.metric("Annual Production", f"{pv_metadata['annual_production']:.0f} kWh/kWp")
-                with col2:
-                    st.metric("Peak Value", f"{pv_metadata['peak_value']:.3f} kWh/interval")
-                with col3:
-                    st.metric("Capacity Factor", f"{pv_metadata['capacity_factor']:.1f}%")
-                with col4:
-                    st.metric("Daylight Hours", f"{pv_metadata['daylight_hours']:.0f}")
-                
-                # Show daily profile
-                st.write("**Average Daily Profile (1 kWp):**")
-                hourly_values = []
-                for h in range(24):
-                    hour_data = pv_data[h*4:(h+1)*4]
-                    hourly_values.append(hour_data.sum())  # Sum kWh for the hour
-                
-                profile_df = pd.DataFrame({
-                    'Hour': range(24),
-                    'Energy (kWh)': hourly_values
-                })
-                
-                st.line_chart(profile_df.set_index('Hour')['Energy (kWh)'])
-            
-            # Load consumption data from TXT
-            is_valid_cons, message_cons, consumption_data = load_txt_file(consumption_file, expected_rows=35040)
-            
-            if not is_valid_cons:
-                st.error(f"❌ Consumption data error: {message_cons}")
-                return
-            
-            # Validate consumption data
-            is_valid_cons, message_cons, cons_metadata = validate_consumption_txt_data(consumption_data)
-            
-            if not is_valid_cons:
-                st.error(f"❌ Consumption validation error: {message_cons}")
-                return
-            
-            st.success(f"✅ Consumption data loaded: {message_cons}")
-            
-            # Display consumption statistics
-            st.subheader("📊 Consumption Profile Summary")
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.metric("Annual Consumption", f"{cons_metadata['annual_consumption']:,.0f} kWh")
-            with col2:
-                st.metric("Average Daily", f"{cons_metadata['daily_average']:,.1f} kWh")
-            with col3:
-                st.metric("Peak Load", f"{cons_metadata['peak_load_kw']:,.1f} kW")
-            with col4:
-                st.metric("Base Load", f"{cons_metadata['base_load_kw']:,.1f} kW")
-            
-        except Exception as e:
-            st.error(f"""
-                ❌ Error reading files: {str(e)}
-                
-                **Please check your TXT file format:**
-                - One value per line
-                - Comma (,) as decimal separator
-                - Exactly 35,040 lines
-                - No empty lines or headers
-            """)
-            return
-        
-        # Run optimization
-        st.markdown("---")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            run_optimization = st.button("🚀 Find Optimal System", type="primary", use_container_width=True)
-        with col2:
-            quick_test = st.button("⚡ Quick Test (5 configs)", use_container_width=True)
-        with col3:
-            export_results = st.button("📊 Export Last Results", use_container_width=True, 
-                                     disabled='optimal_system' not in st.session_state)
-        
-        if run_optimization or quick_test:
-            # Prepare inputs
-            user_inputs = {
-                "budget": budget,
-                "available_area_m2": available_area_m2
-            }
-            
-            config = {
-                'bess_dod': dod,
-                'bess_c_rate': c_rate,
-                'bess_efficiency': efficiency,
-                'bess_cycles': bess_cycles,
-                'pv_degradation_rate': pv_degr,
-                'bess_calendar_degradation_rate': bess_cal_degr,
-                'grid_price_buy': grid_buy,
-                'grid_price_sell': grid_sell,
-                'wacc': wacc
-            }
-            
-            if quick_test:
-                # Quick test of specific configurations
-                st.subheader("⚡ Quick Test Results")
-                
-                test_configs = [
-                    (50, 50, "Balanced medium"),
-                    (100, 100, "Balanced large"),
-                    (150, 75, "PV-heavy"),
-                    (75, 150, "Battery-heavy"),
-                    (100, 0, "PV only")
-                ]
-                
-                results = []
-                for pv_kwp, bess_kwh, desc in test_configs:
-                    # Check constraints
-                    capex_pv = pv_kwp * (600 + 600 * np.exp(-pv_kwp / 290))
-                    capex_bess = bess_kwh * 150
-                    total_capex = capex_pv + capex_bess
-                    
-                    if total_capex <= budget and pv_kwp <= available_area_m2 / 5.0:
-                        result = run_simulation_vectorized_v3(
-                            pv_kwp, bess_kwh, pv_data, consumption_data, 
-                            config, export_details=export_daily_data
-                        )
-                        
-                        results.append({
-                            'Configuration': f"{pv_kwp} kWp / {bess_kwh} kWh",
-                            'Description': desc,
-                            'CAPEX (€)': f"{total_capex:,.0f}",
-                            'NPV (€)': f"{result['npv_eur']:,.0f}",
-                            'Payback (years)': f"{result['payback_period_years']:.1f}" if result['payback_period_years'] < 25 else "> 25",
-                            'Self-sufficiency (%)': f"{result['self_sufficiency_rate']*100:.1f}"
-                        })
-                
-                df_results = pd.DataFrame(results)
-                st.dataframe(df_results, use_container_width=True)
-                
-            else:
-                # Full optimization
-                with st.spinner('🔄 Running optimization...'):
-                    optimal_system = find_optimal_system_v3(
-                        user_inputs, config, pv_data, consumption_data, enable_debug
-                    )
-                    
-                    if optimal_system:
-                        # Save to session state
-                        st.session_state['optimal_system'] = optimal_system
-                        st.session_state['config'] = config
-                        st.session_state['export_daily'] = export_daily_data
-                        
-                        # Display results
-                        st.success("✅ Optimization Complete!")
-                        
-                        # Key metrics
-                        st.header("🏆 Optimal System Configuration")
-                        col1, col2, col3, col4 = st.columns(4)
-                        
-                        with col1:
-                            st.metric("PV System", f"{optimal_system['optimal_kwp']} kWp")
-                        with col2:
-                            st.metric("Battery", f"{optimal_system['optimal_kwh']} kWh")
-                        with col3:
-                            payback_text = f"{optimal_system['payback_period_years']:.1f} years" if optimal_system['payback_period_years'] < 25 else "> 25 years"
-                            st.metric("Payback", payback_text)
-                        with col4:
-                            st.metric("Self-Sufficiency", f"{optimal_system['self_sufficiency_rate'] * 100:.1f}%")
-                        
-                        # Financial analysis
-                        st.subheader("💰 Financial Analysis")
-                        col1, col2, col3 = st.columns(3)
-                        
-                        with col1:
-                            st.metric("Total Investment", f"€{optimal_system['total_capex_eur']:,.0f}")
-                        with col2:
-                            st.metric("10-Year NPV", f"€{optimal_system['npv_eur']:,.0f}")
-                        with col3:
-                            st.metric("Annual O&M", f"€{optimal_system['om_costs']:,.0f}")
-                        
-                        # Cash flow visualization
-                        with st.expander("📊 View Cash Flow Analysis"):
-                            cf_data = optimal_system['cash_flows'][:11]  # 11 years
-                            cumulative_cf = np.cumsum(cf_data)
-                            
-                            cf_df = pd.DataFrame({
-                                'Year': range(len(cf_data)),
-                                'Annual Cash Flow': cf_data,
-                                'Cumulative Cash Flow': cumulative_cf
-                            })
-                            
-                            st.line_chart(cf_df.set_index('Year')['Cumulative Cash Flow'])
-                            st.caption("Cumulative cash flow showing payback period")
-                        
-                        # Annual metrics
-                        with st.expander("📈 View Annual Energy Flows"):
-                            annual_metrics_df = pd.DataFrame(optimal_system['annual_metrics'])
-                            annual_metrics_df['Year'] = annual_metrics_df['year']
-                            
-                            # Energy flows chart
-                            energy_cols = ['pv_production', 'energy_bought', 'energy_sold', 'energy_from_battery']
-                            energy_df = annual_metrics_df[['Year'] + energy_cols].set_index('Year')
-                            energy_df.columns = ['PV Production', 'Grid Import', 'Grid Export', 'Battery Discharge']
-                            
-                            st.bar_chart(energy_df)
-                            st.caption("Annual energy flows (kWh)")
-                    else:
-                        st.error("❌ No valid solution found within constraints")
-        
-        # Export results section
-        if export_results and 'optimal_system' in st.session_state:
-            st.markdown("---")
-            st.subheader("📊 Export Detailed Calculations")
-            
-            optimal_system = st.session_state['optimal_system']
-            config = st.session_state['config']
-            
-            try:
-                # Generate reports
-                annual_df, financial_df, config_df, timestep_df = export_detailed_calculations(
-                    optimal_system, config,
-                    optimal_system['optimal_kwp'],
-                    optimal_system['optimal_kwh']
-                )
-                
-                # Create download options
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    # ZIP download
-                    zip_buffer = create_calculation_report_zip(annual_df, financial_df, config_df, timestep_df)
-                    st.download_button(
-                        label="📦 Download Complete Report (ZIP)",
-                        data=zip_buffer.getvalue(),
-                        file_name=f"pv_bess_report_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                        mime="application/zip"
-                    )
-                
-                with col2:
-                    # Summary text
-                    summary_text = f"""
-PV & BESS Optimization Results
-==============================
-Date: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-Optimal Configuration:
-- PV System: {optimal_system['optimal_kwp']} kWp
-- Battery: {optimal_system['optimal_kwh']} kWh
-- Total CAPEX: €{optimal_system['total_capex_eur']:,.0f}
-
-Financial Metrics:
-- 10-Year NPV: €{optimal_system['npv_eur']:,.0f}
-- Payback Period: {optimal_system['payback_period_years']:.1f} years
-- Self-Sufficiency: {optimal_system['self_sufficiency_rate'] * 100:.1f}%
-
-Parameters Used:
-- Grid Buy Price: €{config['grid_price_buy']:.3f}/kWh
-- Grid Sell Price: €{config['grid_price_sell']:.3f}/kWh
-- WACC: {config['wacc']*100:.1f}%
-"""
-                    st.download_button(
-                        label="📄 Download Summary (TXT)",
-                        data=summary_text,
-                        file_name=f"pv_bess_summary_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                        mime="text/plain"
-                    )
-                
-                st.success("✅ Export files ready for download!")
-                
-            except Exception as e:
-                st.error(f"❌ Export error: {str(e)}")
-    
-    else:
-        # Instructions
-        st.info("""
-            📁 **Please upload both TXT files to begin:**
-            
-            1. **PV Production Data** (TXT)
-               - 35,040 lines (one value per line)
-               - Values in kWh per 15-minute interval
-               - Data for 1 kWp reference system
-               - Comma (,) as decimal separator
-               - Expected annual: 800-1800 kWh/kWp
-               
-            2. **Consumption Data** (TXT)
-               - 35,040 lines (one value per line)
-               - Values in kWh per 15-minute interval
-               - Comma (,) as decimal separator
-               - Will be repeated for 5-year simulation
-               
-            **💡 TXT Format Example:**
-            ```
-            0,125000
-            0,130500
-            0,128750
-            ...
-            ```
-            
-        """)
-    
-    # Footer
-    st.markdown("---")
-    st.markdown("""
-        <div style='text-align: center; color: #888;'>
-            <p>PV & BESS Optimizer v3.0 - TXT File Support</p>
-            <p>Optimized for accuracy with European decimal format</p>
-            <p>Made with ❤️ using Streamlit</p>
-        </div>
-    """, unsafe_allow_html=True)
-
-
-if __name__ == "__main__":
-    build_ui()
+    return
