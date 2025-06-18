@@ -1312,4 +1312,4 @@ def generate_sample_txt_file(data_type: str, annual_value: float = None) -> str:
         formatted_value = f"{value:.6f}".replace('.', ',')
         lines.append(formatted_value)
     
-    return
+    return '\n'.join(lines)
