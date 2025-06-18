@@ -697,8 +697,8 @@ def build_ui():
         budget = st.number_input(
             "Maximum Budget (€)",
             min_value=10000,
-            max_value=500000,
-            value=80000,
+            max_value=2500000,
+            value=500000,
             step=1000,
             help="Total available budget for PV and BESS installation"
         )
@@ -706,7 +706,7 @@ def build_ui():
         available_area_m2 = st.number_input(
             "Available Area for PV (m²)",
             min_value=10,
-            max_value=5000,
+            max_value=10000,
             value=400,
             step=10,
             help="Total roof or ground area available for solar panels (5 m²/kWp)"
@@ -729,127 +729,6 @@ def build_ui():
             key="pv_upload"
         )
         
-        # Show sample PV data format
-        with st.expander("📋 View Sample PV Data Format"):
-            st.code("""
-pv_production
-0.000
-0.000
-0.000
-0.125
-0.285
-0.412
-...
-(35,040 rows total)
-            """)
-            
-            st.info("""
-            💡 **PV Data Format Options:**
-            
-            **1. Power Values (kW)** - Instantaneous power
-            - Range: 0 to ~1 kW for 1 kWp system
-            - Example: 0.850 = 850 W instantaneous power
-            
-            **2. Energy Values (kWh)** - Energy per 15-min interval
-            - Range: 0 to ~0.25 kWh for 1 kWp system  
-            - Example: 0.212 = 212 Wh in 15 minutes
-            
-            The system **automatically detects** which format you're using based on the maximum values!
-            
-            **CSV Format Support:**
-            - European: Semicolon separator with comma decimal (0,850)
-            - International: Comma separator with dot decimal (0.850)
-            """)
-            
-            if st.button("📊 Generate Sample PV Data"):
-                # Generate realistic PV profile for 1 kWp
-                hours = np.arange(0, 8760, 0.25)  # 15-min intervals
-                
-                # Solar profile: zero at night, bell curve during day
-                daily_pattern = np.zeros(96)  # 96 intervals per day
-                sunrise = 24  # 6 AM
-                sunset = 72   # 6 PM
-                peak = 48     # 12 PM
-                
-                for i in range(sunrise, sunset):
-                    angle = (i - sunrise) * np.pi / (sunset - sunrise)
-                    daily_pattern[i] = 0.85 * np.sin(angle) ** 1.5  # Peak at 0.85 kW for 1 kWp
-                
-                # Add seasonal variation
-                pv_production = []
-                for day in range(365):
-                    seasonal_factor = 0.7 + 0.3 * np.cos((day - 172) * 2 * np.pi / 365)  # Peak in summer
-                    daily_production = daily_pattern * seasonal_factor
-                    
-                    # Add some random variation
-                    daily_production *= (0.9 + 0.2 * np.random.random())
-                    
-                    pv_production.extend(daily_production)
-                
-                pv_sample_df = pd.DataFrame({
-                    'pv_production_kw': pv_production[:35040]  # Ensure exactly 35040 rows
-                })
-                
-                # Let user choose format
-                data_format = st.radio(
-                    "Choose data format:",
-                    ["kW (instantaneous power)", "kWh (energy per 15-min interval)"],
-                    key="pv_data_format_choice"
-                )
-                
-                csv_format = st.radio(
-                    "Choose CSV format:",
-                    ["International (comma separator, dot decimal)", 
-                     "European (semicolon separator, comma decimal)"],
-                    key="pv_csv_format_choice"
-                )
-                
-                # Adjust values based on format choice
-                if data_format == "kWh (energy per 15-min interval)":
-                    # Convert kW to kWh (multiply by 0.25 hours)
-                    pv_sample_df['pv_production'] = pv_sample_df['pv_production_kw'] * 0.25
-                    column_name = 'pv_production_kwh'
-                else:
-                    pv_sample_df['pv_production'] = pv_sample_df['pv_production_kw']
-                    column_name = 'pv_production_kw'
-                
-                # Create final dataframe with appropriate column name
-                final_df = pd.DataFrame({
-                    column_name: pv_sample_df['pv_production']
-                })
-                
-                if csv_format == "European (semicolon separator, comma decimal)":
-                    # Convert to European format
-                    csv = final_df.to_csv(index=False, sep=';', decimal=',')
-                    file_name = f"sample_pv_1kwp_{data_format[:3]}_EU.csv"
-                else:
-                    # Standard format
-                    csv = final_df.to_csv(index=False)
-                    file_name = f"sample_pv_1kwp_{data_format[:3]}.csv"
-                
-                st.download_button(
-                    label=f"📥 Download Sample PV (1 kWp) - {data_format[:3]} format",
-                    data=csv,
-                    file_name=file_name,
-                    mime="text/csv",
-                    key="download_pv_sample"
-                )
-                
-                # Show preview
-                st.write("**Preview (first day):**")
-                fig_data = pd.DataFrame({
-                    'Hour': np.arange(0, 24, 0.25),
-                    f'PV ({data_format[:3]})': final_df.iloc[:96].values.flatten()
-                })
-                st.line_chart(fig_data.set_index('Hour'))
-                
-                # Show annual production
-                if data_format == "kWh (energy per 15-min interval)":
-                    annual_prod = final_df.sum().values[0]
-                else:
-                    annual_prod = final_df.sum().values[0] * 0.25
-                
-                st.info(f"Annual production (1 kWp): {annual_prod:.0f} kWh")
         
         # Consumption Profile
         st.subheader("3. Consumption Profile")
@@ -867,92 +746,7 @@ pv_production
             key="consumption_upload"
         )
         
-        # Sample consumption data generator
-        with st.expander("📋 Generate Sample Consumption Data"):
-            st.code("""
-consumption_kWh
-0.125
-0.130
-0.128
-...
-(35,040 rows total)
-            """)
-            
-            st.info("""
-            💡 **Supported CSV Formats:**
-            
-            **Option 1 - Semicolon separator with comma decimal (European):**
-            ```
-            consumption_kWh
-            0,125
-            0,130
-            1,234
-            ```
-            
-            **Option 2 - Comma separator with dot decimal (International):**
-            ```
-            consumption_kWh
-            0.125
-            0.130
-            1.234
-            ```
-            """)
-            
-            if st.button("📊 Generate Sample Consumption Data"):
-                # Generate realistic consumption profile
-                hours = np.arange(0, 8760, 0.25)  # 15-min intervals for a year
-                
-                # Base load + daily pattern + seasonal variation + noise
-                base_load = 0.3
-                daily_pattern = 0.4 * np.sin((hours % 24 - 6) * np.pi / 12) ** 2
-                seasonal_pattern = 0.2 * np.cos((hours / 8760) * 2 * np.pi)
-                noise = np.random.normal(0, 0.05, len(hours))
-                
-                consumption = np.maximum(0, base_load + daily_pattern + seasonal_pattern + noise)
-                
-                sample_df = pd.DataFrame({
-                    'consumption_kWh': consumption[:35040]  # Ensure exactly 35040 rows
-                })
-                
-                # Scale to realistic annual consumption (e.g., 10,000 kWh/year)
-                current_annual = sample_df['consumption_kWh'].sum()
-                target_annual = 10000  # kWh
-                sample_df['consumption_kWh'] = sample_df['consumption_kWh'] * (target_annual / current_annual)
-                
-                # Let user choose format
-                format_choice = st.radio(
-                    "Choose CSV format:",
-                    ["International (comma separator, dot decimal)", 
-                     "European (semicolon separator, comma decimal)"],
-                    key="cons_format_choice"
-                )
-                
-                if format_choice == "European (semicolon separator, comma decimal)":
-                    # Convert to European format
-                    csv = sample_df.to_csv(index=False, sep=';', decimal=',')
-                    file_name = "sample_consumption_data_EU.csv"
-                else:
-                    # Standard format
-                    csv = sample_df.to_csv(index=False)
-                    file_name = "sample_consumption_data.csv"
-                
-                st.download_button(
-                    label=f"📥 Download Sample Consumption Data - {format_choice.split(' ')[0]} Format",
-                    data=csv,
-                    file_name=file_name,
-                    mime="text/csv",
-                    key="download_consumption_sample"
-                )
-                
-                # Show preview
-                st.write("**Preview (first day):**")
-                fig_data = pd.DataFrame({
-                    'Hour': np.arange(0, 24, 0.25),
-                    'Consumption (kWh)': sample_df['consumption_kWh'].iloc[:96].values
-                })
-                st.line_chart(fig_data.set_index('Hour'))
-                st.info(f"Annual consumption: {sample_df['consumption_kWh'].sum():.0f} kWh")
-        
+  
         # Advanced settings
         with st.expander("⚙️ Advanced Settings"):
             st.write("**Electricity Prices**")
