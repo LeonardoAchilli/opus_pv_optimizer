@@ -10,97 +10,93 @@ from typing import Dict, Tuple, Optional, List
 # SECTION 1: BACKEND LOGIC - OPTIMIZED VERSION
 # ==============================================================================
 
-def validate_pv_data(pv_df: pd.DataFrame) -> Tuple[bool, str, Optional[pd.DataFrame]]:
+def process_pv_data(pv_df: pd.DataFrame) -> Tuple[bool, str, Optional[pd.DataFrame]]:
     """
-    Validate PV production data from uploaded CSV.
-    Handles both comma and dot as decimal separator.
+    Processa i dati di produzione PV dal CSV caricato.
+    Assume che l'utente fornisca dati in kWh per intervallo di 15 minuti.
     
     Returns:
-        Tuple of (is_valid, error_message, processed_dataframe)
+        Tuple of (is_valid, message, processed_dataframe)
     """
-    # Check if dataframe has any columns
+    # Check if dataframe is empty
     if pv_df.empty:
         return False, "File is empty", None
     
-    # Get the first column regardless of name
+    # Check if dataframe has columns
     if len(pv_df.columns) == 0:
         return False, "No columns found in CSV", None
     
     # Use the first column as PV production data
     pv_column = pv_df.columns[0]
     
-    # Check if we need to convert values
-    # If the column is already numeric, no conversion needed
-    if pd.api.types.is_numeric_dtype(pv_df[pv_column]):
-        clean_df = pd.DataFrame({
-            'pv_production_kwp': pv_df[pv_column]
-        })
-    else:
-        # Column contains strings, need to convert
-        # Replace comma with dot for decimal separator
-        pv_df[pv_column] = pv_df[pv_column].astype(str).str.replace(',', '.', regex=False)
-        
-        # Create a clean dataframe with standardized column name
-        try:
-            clean_df = pd.DataFrame({
-                'pv_production_kwp': pd.to_numeric(pv_df[pv_column], errors='coerce')
-            })
-        except Exception as e:
-            return False, f"Error converting values to numbers: {str(e)}", None
-        
-        # Check for conversion errors
-        if clean_df['pv_production_kwp'].isna().sum() > 0:
-            n_errors = clean_df['pv_production_kwp'].isna().sum()
-            return False, f"Found {n_errors} values that couldn't be converted to numbers", None
+    # Create clean dataframe with standardized column name
+    clean_df = pd.DataFrame({
+        'pv_production_kwp': pv_df[pv_column]
+    })
     
     # Check number of rows
     expected_rows = 35040
     actual_rows = len(clean_df)
     
     if actual_rows != expected_rows:
-        # Try to handle common cases
-        if actual_rows == 8760:  # Hourly data
-            # Resample to 15-minute intervals
-            clean_df = clean_df.iloc[np.repeat(np.arange(len(clean_df)), 4)].reset_index(drop=True)
-            clean_df = clean_df.iloc[:expected_rows]  # Ensure exact length
-            return True, f"Converted hourly data to 15-min intervals", clean_df
-        else:
-            return False, f"Expected {expected_rows:,} rows (15-min intervals for 1 year), found {actual_rows:,}", None
-    
-    # Validate data range
-    if clean_df['pv_production_kwp'].min() < 0:
-        return False, "Negative values found in PV production data", None
-    
-    # Determine if values are in kW or kWh based on typical ranges
-    max_value = clean_df['pv_production_kwp'].max()
-    sum_value = clean_df['pv_production_kwp'].sum()
-    
-    # If max value is < 0.5, likely kWh per interval; if > 0.5, likely kW
-    if max_value < 0.5:
-        # Values appear to be in kWh per 15-min interval
-        annual_production = sum_value  # Already in kWh
-        st.info(f"📊 Detected format: kWh per 15-min interval (max value: {max_value:.3f})")
-    else:
-        # Values appear to be in kW
-        annual_production = sum_value * 0.25  # Convert to kWh
-        st.info(f"📊 Detected format: kW instantaneous power (max value: {max_value:.3f})")
+        return False, f"Expected {expected_rows:,} rows (15-min intervals for 1 year), found {actual_rows:,}", None
     
     # Check if all values are zero
-    if sum_value == 0:
+    if clean_df['pv_production_kwp'].sum() == 0:
         return False, "All PV production values are zero", None
     
+    # Calculate annual production (assuming kWh per 15-min interval)
+    annual_production = clean_df['pv_production_kwp'].sum()
+    
     # Check if annual production is reasonable
-    if annual_production < 500:  # Less than 500 kWh/kWp/year is too low
+    if annual_production < 500:
         return False, f"Annual production too low: {annual_production:.0f} kWh/kWp. Expected 800-1500 kWh/kWp for Europe", None
     
-    if annual_production > 2000:  # More than 2000 kWh/kWp/year is too high
+    if annual_production > 2000:
         return False, f"Annual production too high: {annual_production:.0f} kWh/kWp. Expected 800-1500 kWh/kWp for Europe", None
     
-    # Store the detected format in the dataframe attributes for later use
-    clean_df.attrs['is_kwh_format'] = (max_value < 0.5)
+    # Store annual production for reference
     clean_df.attrs['annual_production'] = annual_production
     
     return True, f"Valid PV data - Annual production: {annual_production:.0f} kWh/kWp", clean_df
+
+
+def process_consumption_data(consumption_df: pd.DataFrame) -> Tuple[bool, str, Optional[pd.DataFrame]]:
+    """
+    Processa i dati di consumo dal CSV caricato.
+    
+    Returns:
+        Tuple of (is_valid, message, processed_dataframe)
+    """
+    # Check if dataframe is empty
+    if consumption_df.empty:
+        return False, "File is empty", None
+    
+    # Check required column exists
+    if 'consumption_kWh' not in consumption_df.columns:
+        return False, "CSV must contain 'consumption_kWh' column", None
+    
+    # Create clean dataframe
+    clean_df = pd.DataFrame({
+        'consumption_kWh': consumption_df['consumption_kWh']
+    })
+    
+    # Check number of rows
+    expected_rows = 35040
+    actual_rows = len(clean_df)
+    
+    if actual_rows != expected_rows:
+        return False, f"Expected {expected_rows:,} rows (15-min intervals for 1 year), found {actual_rows:,}", None
+    
+    # Check if all values are zero
+    if clean_df['consumption_kWh'].sum() == 0:
+        return False, "All consumption values are zero", None
+    
+    # Calculate annual consumption for reference
+    annual_consumption = clean_df['consumption_kWh'].sum()
+    clean_df.attrs['annual_consumption'] = annual_consumption
+    
+    return True, f"Valid consumption data - Annual consumption: {annual_consumption:.0f} kWh", clean_df
 
 
 def run_simulation_vectorized(pv_kwp: float, bess_kwh_nominal: float, pv_production_baseline: pd.DataFrame, 
@@ -108,7 +104,7 @@ def run_simulation_vectorized(pv_kwp: float, bess_kwh_nominal: float, pv_product
                             export_details: bool = False, debug: bool = False) -> Dict:
     """
     Optimized vectorized simulation with exact energy flow formulas.
-    Handles both kW and kWh input formats for PV data.
+    Assumes PV data is in kWh per 15-min interval.
     """
     # Extract configuration parameters
     dod = config['bess_dod']
@@ -126,25 +122,18 @@ def run_simulation_vectorized(pv_kwp: float, bess_kwh_nominal: float, pv_product
     pv_base = pv_production_baseline['pv_production_kwp'].to_numpy(dtype=np.float32)
     cons = consumption_profile['consumption_kWh'].to_numpy(dtype=np.float32)
     
-    # Check if PV data is already in kWh format
-    is_kwh_format = pv_production_baseline.attrs.get('is_kwh_format', False)
-    
     # Debug information
     if debug:
         st.write("### 🔍 Debug Information - Simulation Input")
         st.write(f"**PV System:** {pv_kwp} kWp")
         st.write(f"**Battery:** {bess_kwh_nominal} kWh (usable: {kwh_netti:.1f} kWh)")
-        st.write(f"**PV data format:** {'kWh per interval' if is_kwh_format else 'kW instantaneous'}")
         st.write(f"**PV baseline data points:** {len(pv_base)}")
         
-        if is_kwh_format:
-            annual_prod_1kwp = pv_base.sum()
-        else:
-            annual_prod_1kwp = pv_base.sum() * 0.25
+        annual_prod_1kwp = pv_base.sum()
         
         st.write(f"**PV baseline stats (1 kWp):**")
         st.write(f"  - Annual production: {annual_prod_1kwp:.0f} kWh")
-        st.write(f"  - Peak value: {pv_base.max():.3f} {'kWh/interval' if is_kwh_format else 'kW'}")
+        st.write(f"  - Peak value: {pv_base.max():.3f} kWh/interval")
         st.write(f"  - Non-zero values: {(pv_base > 0).sum()} of {len(pv_base)}")
     
     # Calculate base case annual cost
@@ -168,12 +157,8 @@ def run_simulation_vectorized(pv_kwp: float, bess_kwh_nominal: float, pv_product
     # Run 5-year simulation
     for year in range(5):
         # Apply PV degradation and scale by system size
-        if is_kwh_format:
-            # Data is already in kWh per 15-min interval
-            pv_production = pv_base * pv_kwp * pv_degradation_factors[year]
-        else:
-            # Data is in kW, convert to kWh per 15-min
-            pv_production = pv_base * pv_kwp * pv_degradation_factors[year] * 0.25
+        # Data is in kWh per 15-min interval
+        pv_production = pv_base * pv_kwp * pv_degradation_factors[year]
         
         if debug and year == 0:
             st.write(f"**Year 1 PV production:**")
@@ -639,6 +624,8 @@ Energy flow calculation (per 15-minute interval):
 3. Grid import = max(0, consumption - production - battery_discharge*efficiency)
 4. SoC update based on energy balance
 5. SoH degradation based on cycling and calendar aging
+
+Note: All PV production values are assumed to be in kWh per 15-minute interval.
 """
         
         zip_file.writestr('README.txt', readme_content)
@@ -717,9 +704,8 @@ def build_ui():
         st.markdown("""
             📁 **Upload PV production baseline (1 kWp)**
             - 35,040 rows (15-min intervals)
-            - Values in **kW** (instantaneous power) or **kWh** (energy per interval)
-            - ✅ Auto-detects format based on values
-            - ✅ Supports comma (1,234) or dot (1.234) decimals
+            - Values in **kWh** (energy per interval)
+            - Expected annual production: 800-1500 kWh/kWp
         """)
         
         pv_file = st.file_uploader(
@@ -736,7 +722,7 @@ def build_ui():
             📁 **Upload consumption data**
             - Column named 'consumption_kWh'
             - 35,040 rows (15-min intervals)
-            - ✅ Supports both comma (1,234) and dot (1.234) as decimal separator
+            - Values in kWh per interval
         """)
         
         consumption_file = st.file_uploader(
@@ -783,32 +769,16 @@ def build_ui():
     if pv_file is not None and consumption_file is not None:
         try:
             # Load and validate PV data
-            # Try different separators to handle various CSV formats
-            try:
-                # First try with semicolon separator (common in European CSVs)
-                pv_df = pd.read_csv(pv_file, sep=';', decimal=',')
-            except:
-                try:
-                    # Then try with comma separator and dot decimal
-                    pv_file.seek(0)  # Reset file pointer
-                    pv_df = pd.read_csv(pv_file, sep=',', decimal='.')
-                except:
-                    # Finally try tab separator
-                    pv_file.seek(0)  # Reset file pointer
-                    pv_df = pd.read_csv(pv_file, sep='\t', decimal=',')
-            
-            is_valid, message, pv_baseline = validate_pv_data(pv_df)
+            pv_df = pd.read_csv(pv_file)
+            is_valid, message, pv_baseline = process_pv_data(pv_df)
             
             if not is_valid:
                 st.error(f"❌ PV data error: {message}")
                 return
             else:
-                # Show success with format info
-                format_type = "kWh per interval" if pv_baseline.attrs.get('is_kwh_format', False) else "kW instantaneous"
                 annual_prod = pv_baseline.attrs.get('annual_production', 0)
                 st.success(f"""
                     ✅ PV data loaded successfully!
-                    - Format detected: **{format_type}**
                     - Annual production: **{annual_prod:.0f} kWh/kWp**
                     - {message}
                 """)
@@ -817,16 +787,11 @@ def build_ui():
                 with st.expander("📊 PV Production Statistics (1 kWp baseline)"):
                     col1, col2, col3, col4 = st.columns(4)
                     
-                    # Get format info
-                    is_kwh_format = pv_baseline.attrs.get('is_kwh_format', False)
+                    # Get annual production
                     annual_pv = pv_baseline.attrs.get('annual_production', 0)
                     
-                    if is_kwh_format:
-                        peak_power = pv_baseline['pv_production_kwp'].max() * 4  # Convert to kW
-                        st.write(f"**Data format detected:** kWh per 15-min interval")
-                    else:
-                        peak_power = pv_baseline['pv_production_kwp'].max()
-                        st.write(f"**Data format detected:** kW instantaneous power")
+                    # Calculate peak power (convert from kWh per 15-min to kW)
+                    peak_power = pv_baseline['pv_production_kwp'].max() * 4
                     
                     capacity_factor = annual_pv / (1 * 8760) * 100  # 1 kWp * hours in year
                     
@@ -840,145 +805,54 @@ def build_ui():
                         daylight_hours = (pv_baseline['pv_production_kwp'] > 0).sum() / 4
                         st.metric("Daylight Hours", f"{daylight_hours:.0f}")
                     
-                    # Show data format verification
-                    st.write("**Data Format Verification (first 5 values):**")
-                    first_values = pv_baseline['pv_production_kwp'].head()
-                    verification_df = pd.DataFrame({
-                        'Index': range(len(first_values)),
-                        'Raw Value': first_values.values,
-                        'Unit': ['kWh/15min' if is_kwh_format else 'kW'] * len(first_values)
-                    })
-                    st.dataframe(verification_df, use_container_width=False)
-                    
                     # Show daily profile
                     st.write("**Average Daily Profile (1 kWp):**")
                     hourly_avg = []
                     for h in range(24):
                         hour_data = pv_baseline.iloc[h*4:(h+1)*4]['pv_production_kwp']
-                        if is_kwh_format:
-                            # Sum kWh values for the hour
-                            hourly_avg.append(hour_data.sum())
-                        else:
-                            # Average kW values for the hour
-                            hourly_avg.append(hour_data.mean())
+                        # Sum kWh values for the hour
+                        hourly_avg.append(hour_data.sum())
                     
                     profile_df = pd.DataFrame({
                         'Hour': range(24),
-                        'Value': hourly_avg
+                        'Energy (kWh)': hourly_avg
                     })
                     
-                    if is_kwh_format:
-                        st.write("Hourly energy (kWh):")
-                    else:
-                        st.write("Average hourly power (kW):")
-                    
-                    st.line_chart(profile_df.set_index('Hour')['Value'])
+                    st.line_chart(profile_df.set_index('Hour')['Energy (kWh)'])
             
-            # Load consumption data
-            # Try different separators to handle various CSV formats
-            try:
-                # First try with semicolon separator (common in European CSVs)
-                consumption_df = pd.read_csv(consumption_file, sep=';', decimal=',')
-            except:
-                try:
-                    # Then try with comma separator and dot decimal
-                    consumption_file.seek(0)  # Reset file pointer
-                    consumption_df = pd.read_csv(consumption_file, sep=',', decimal='.')
-                except:
-                    # Finally try tab separator
-                    consumption_file.seek(0)  # Reset file pointer
-                    consumption_df = pd.read_csv(consumption_file, sep='\t', decimal=',')
+            # Load and validate consumption data
+            consumption_df = pd.read_csv(consumption_file)
+            is_valid, message, consumption_baseline = process_consumption_data(consumption_df)
             
-            if 'consumption_kWh' not in consumption_df.columns:
-                st.error("❌ Consumption CSV must contain 'consumption_kWh' column")
+            if not is_valid:
+                st.error(f"❌ Consumption data error: {message}")
                 return
-            
-            # Handle comma as decimal separator in consumption data only if needed
-            if not pd.api.types.is_numeric_dtype(consumption_df['consumption_kWh']):
-                # Data is not numeric, need to convert
-                consumption_df['consumption_kWh'] = consumption_df['consumption_kWh'].astype(str).str.replace(',', '.', regex=False)
-                try:
-                    consumption_df['consumption_kWh'] = pd.to_numeric(consumption_df['consumption_kWh'], errors='coerce')
-                    
-                    # Check for conversion errors
-                    n_errors = consumption_df['consumption_kWh'].isna().sum()
-                    if n_errors > 0:
-                        st.warning(f"⚠️ Found {n_errors} values that couldn't be converted to numbers. They will be treated as 0.")
-                        consumption_df['consumption_kWh'] = consumption_df['consumption_kWh'].fillna(0)
-                except Exception as e:
-                    st.error(f"❌ Error converting consumption values: {str(e)}")
-                    return
-            
-            # Validate and adjust consumption data length
-            expected_rows = 35040
-            if len(consumption_df) != expected_rows:
-                st.warning(f"⚠️ Adjusting consumption data from {len(consumption_df):,} to {expected_rows:,} rows")
-                if len(consumption_df) > expected_rows:
-                    consumption_df = consumption_df.iloc[:expected_rows].copy()
-                else:
-                    # Repeat pattern to fill
-                    repeats = (expected_rows // len(consumption_df)) + 1
-                    consumption_df = pd.concat([consumption_df] * repeats).iloc[:expected_rows].reset_index(drop=True)
-            
-            # Validate consumption data is reasonable
-            annual_consumption = consumption_df['consumption_kWh'].sum()
-            if annual_consumption > 100000:  # More than 100 MWh/year
-                st.warning(f"""
-                    ⚠️ **Very high consumption detected:** {annual_consumption:,.0f} kWh/year
-                    
-                    This seems like industrial consumption. Typical values:
-                    - Residential: 3,000-10,000 kWh/year
-                    - Small business: 10,000-50,000 kWh/year
-                    - Large business: 50,000-500,000 kWh/year
-                    
-                    Please verify your data units are correct (kWh per 15-min interval).
-                """)
-            
-            # Check for unrealistic peak values
-            peak_power = consumption_df['consumption_kWh'].max() * 4  # Convert to kW
-            if peak_power > 100:  # More than 100 kW peak
-                st.warning(f"""
-                    ⚠️ **Very high peak power:** {peak_power:.1f} kW
-                    
-                    Typical peak power:
-                    - Residential: 3-10 kW
-                    - Small business: 10-50 kW
-                    
-                    Your data might be in Wh instead of kWh.
-                """)
+            else:
+                st.success(f"✅ Consumption data loaded successfully! {message}")
             
             # Display consumption statistics
             st.subheader("📊 Consumption Profile Summary")
             col1, col2, col3, col4 = st.columns(4)
             
-            total_annual = consumption_df['consumption_kWh'].sum()
+            total_annual = consumption_baseline.attrs['annual_consumption']
             with col1:
                 st.metric("Annual Consumption", f"{total_annual:,.0f} kWh")
             with col2:
                 st.metric("Average Daily", f"{total_annual/365:,.1f} kWh")
             with col3:
-                st.metric("Peak Load", f"{consumption_df['consumption_kWh'].max()*4:,.1f} kW")
+                st.metric("Peak Load", f"{consumption_baseline['consumption_kWh'].max()*4:,.1f} kW")
             with col4:
-                st.metric("Base Load", f"{consumption_df['consumption_kWh'].min()*4:,.1f} kW")
+                st.metric("Base Load", f"{consumption_baseline['consumption_kWh'].min()*4:,.1f} kW")
             
         except Exception as e:
             st.error(f"""
                 ❌ Error reading files: {str(e)}
                 
-                **Common causes:**
-                1. CSV uses semicolon (;) as separator → The system now handles this automatically
-                2. Numbers use comma as decimal separator → The system converts this automatically
-                3. Extra columns or spaces in the data → Check line 34 of your file
-                4. Special characters or formatting issues
-                
                 **Please check your CSV file format:**
-                - Should have only 1 column with header
+                - Should have proper column headers
                 - 35,040 data rows (no empty rows)
                 - No extra separators or columns
-                
-                **Supported formats:**
-                - Semicolon separator with comma decimal: `1,234;` ✅
-                - Comma separator with dot decimal: `1.234,` ✅
+                - Values should be numeric
             """)
             return
         
@@ -998,7 +872,7 @@ def build_ui():
             user_inputs = {
                 "budget": budget,
                 "available_area_m2": available_area_m2,
-                "consumption_profile_df": consumption_df
+                "consumption_profile_df": consumption_baseline
             }
             
             config = {
@@ -1034,7 +908,7 @@ def build_ui():
                     
                     if total_capex <= budget and pv_kwp <= available_area_m2 / 5.0:
                         result = run_simulation_vectorized(pv_kwp, bess_kwh, pv_baseline, 
-                                                         consumption_df, config)
+                                                         consumption_baseline, config)
                         
                         results.append({
                             'Configuration': f"{pv_kwp} kWp / {bess_kwh} kWh",
@@ -1187,10 +1061,8 @@ Parameters Used:
             1. **PV Production Data** (CSV)
                - 35,040 rows of 15-minute intervals
                - Values for 1 kWp reference system
-               - **Accepts both formats:**
-                 - **kW** (instantaneous power): typical range 0-1 kW
-                 - **kWh** (energy per 15-min): typical range 0-0.25 kWh
-               - Auto-detects format based on value ranges
+               - Values in **kWh** (energy per 15-min interval)
+               - Expected annual production: 800-1500 kWh/kWp
                - Single column with header
                
             2. **Consumption Data** (CSV)
@@ -1198,20 +1070,14 @@ Parameters Used:
                - 35,040 rows of 15-minute intervals
                - Values in kWh per interval
                
-            ✅ **Supported CSV Formats:**
-            - **European**: Semicolon separator (;) with comma decimal (1,234)
-            - **International**: Comma separator (,) with dot decimal (1.234)
-            
-            The system automatically detects your format!
-            
-            ⚠️ **Important**: Each file should have only ONE column with data.
+            ⚠️ **Important**: Ensure your data is properly formatted with numeric values.
         """)
     
     # Footer
     st.markdown("---")
     st.markdown("""
         <div style='text-align: center; color: #888;'>
-            <p>PV & BESS Optimizer v2.0 - Optimized Version</p>
+            <p>PV & BESS Optimizer v2.0 - Simplified Version</p>
             <p>Made with ❤️ using Streamlit</p>
         </div>
     """, unsafe_allow_html=True)
